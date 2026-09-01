@@ -3,8 +3,10 @@
 // which is the point: the risk it is testing is whether the batched Solana leg
 // still fits in a transaction, and whether the enclave leg works right after it.
 //
-//   1 base tx     deposit + open ledger + pay clone rent + delegate
-//   1 signature   a login challenge for the enclave (a message, not a transaction)
+//   1 base tx     deposit + open ledger + pay clone rent + authorise a session
+//                 key + delegate. The wallet signs this and nothing else.
+//   0 wallet      everything on the rollup is signed by the session key, because
+//                 wallets refuse Ephemeral Rollup transactions outright.
 //   1 rollup tx   gate the ledger + mark it
 //
 // Then it reads the ledger back three ways, which is the claim.
@@ -47,6 +49,8 @@ const MAGIC_PROGRAM_ID = new PublicKey("Magic11111111111111111111111111111111111
 const DELEGATION_PROGRAM_ID = new PublicKey("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
 const PRIVACY_VALIDATOR = IS_LOCAL ? LOCALNET_VALIDATOR : TEE_VALIDATOR;
 const DEPOSIT = new BN(250_000_000);
+/// Stands in for the keypair a browser would keep in localStorage.
+const SESSION = Keypair.generate();
 
 const usdc = (v: any) => (Number(v.toString()) / 1e6).toFixed(6);
 const step = (n: string, m: string) => console.log(`\n${n} ${m}`);
@@ -116,7 +120,8 @@ async function main() {
     .rpc();
 
   // The whole Solana leg, exactly as the app bundles it.
-  step("[2]", `one transaction: deposit ${usdc(DEPOSIT)} USDC + open + fund + delegate the ledger`);
+  console.log("session", SESSION.publicKey.toBase58(), "(browser-held)");
+  step("[2]", `one transaction: deposit ${usdc(DEPOSIT)} USDC + open + fund + authorise + delegate`);
   const ixs: TransactionInstruction[] = [
     await p.methods
       .deposit(DEPOSIT)
@@ -155,6 +160,10 @@ async function main() {
       })
       .instruction(),
     await p.methods
+      .authorizeSession(SESSION.publicKey)
+      .accounts({ owner: user.publicKey, position })
+      .instruction(),
+    await p.methods
       .delegatePosition()
       .accounts({
         owner: user.publicKey,
@@ -190,11 +199,11 @@ async function main() {
   if (!erUrl) throw new Error("the rollup never took the ledger");
   console.log("      ", erUrl);
 
-  step("[4]", "sign in to the enclave, then gate and mark in one transaction");
-  const erConn = await authedConnectionTo(erUrl, user);
-  const er = programFor(erConn, user);
+  step("[4]", "the session key signs in and seals, with no wallet involved");
+  const erConn = await authedConnectionTo(erUrl, SESSION);
+  const er = programFor(erConn, SESSION);
   const permissionAccounts = {
-    owner: user.publicKey,
+    signer: SESSION.publicKey,
     position,
     permission,
     permissionProgram: PERMISSION_PROGRAM_ID,
@@ -206,15 +215,16 @@ async function main() {
     await er.methods
       .syncPosition()
       .accounts({
-        owner: user.publicKey,
+        signer: SESSION.publicKey,
         position,
+        owner: user.publicKey,
         vault: vaultPda,
         book: bookPda,
         ownerAgyld: userAgyld,
       })
       .instruction(),
   );
-  console.log("      ", await sendAndPoll(erConn, erTx, [user]));
+  console.log("      ", await sendAndPoll(erConn, erTx, [SESSION]));
 
   step("[5]", "who can read the ledger");
   const stranger = Keypair.generate();
@@ -222,7 +232,7 @@ async function main() {
   const asOwner = await erConn.getAccountInfo(position);
   const asStranger = await strangerConn.getAccountInfo(position).catch(() => null);
   const asAnon: any = await rawRead(erUrl, position);
-  console.log(`       owner (on the permission) ${asOwner ? `${asOwner.data.length} bytes` : "nothing"}`);
+  console.log(`       session key (a member)    ${asOwner ? `${asOwner.data.length} bytes` : "nothing"}`);
   console.log(`       stranger (valid login)    ${asStranger ? `${asStranger.data.length} bytes` : "nothing"}`);
   console.log(`       anonymous (no login)      ${asAnon?.result?.value ? "data" : "nothing"}`);
 

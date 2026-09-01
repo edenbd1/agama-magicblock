@@ -49,7 +49,7 @@ declare_id!("GVHsSaFUkVAZJdRKWtK1SxYUhW2P7a7z1xBL5SaFj5vC");
 
 pub const VAULT_SEED: &[u8] = b"agama-vault";
 pub const BOOK_SEED: &[u8] = b"lending-book";
-pub const POSITION_SEED: &[u8] = b"position";
+pub const POSITION_SEED: &[u8] = b"position-v2";
 pub const USDC_SEED: &[u8] = b"usdc-mint";
 pub const AGYLD_SEED: &[u8] = b"agyld-mint";
 pub const CLAIM_SEED: &[u8] = b"faucet-claim";
@@ -63,6 +63,10 @@ pub const SECONDS_PER_YEAR: u128 = 31_536_000;
 /// Faucet drip and cooldown (devnet only).
 pub const FAUCET_AMOUNT: u64 = 1_000 * ONE;
 pub const FAUCET_COOLDOWN: i64 = 60;
+
+/// How long a browser session key stays valid. Long enough not to nag, short
+/// enough that a stolen one expires on its own.
+pub const SESSION_TTL: i64 = 7 * 24 * 3600;
 
 /// Lamports every account must hold before a rollup will clone it.
 ///
@@ -325,6 +329,20 @@ pub mod agama_magicblock {
         Ok(())
     }
 
+    /// Authorise a browser-held key to act on this position inside the rollup.
+    ///
+    /// Base layer, so the wallet signs it, and it rides along in the same
+    /// transaction as the deposit. That is what keeps a private deposit down to one
+    /// approval instead of three.
+    pub fn authorize_session(ctx: Context<AuthorizeSession>, session_key: Pubkey) -> Result<()> {
+        require!(session_key != Pubkey::default(), AgamaError::Unauthorized);
+        let now = Clock::get()?.unix_timestamp;
+        let position = &mut ctx.accounts.position;
+        position.session_key = session_key;
+        position.session_expiry = now + SESSION_TTL;
+        Ok(())
+    }
+
     /// Top a position and its owner's agYLD account up to the rollup's clone floor.
     ///
     /// Both accounts get read inside the enclave when the position is synced, and
@@ -468,6 +486,8 @@ pub mod agama_magicblock {
     ///
     /// Idempotent, because ER transactions get retried.
     pub fn init_permission(ctx: Context<PermissionCtx>, viewers: Vec<Pubkey>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        assert_may_act(&ctx.accounts.position, ctx.accounts.signer.key, now)?;
         require!(
             viewers.len() + 1 <= MAX_PERMISSION_MEMBERS,
             AgamaError::TooManyMembers
@@ -493,7 +513,7 @@ pub mod agama_magicblock {
             vault: ctx.accounts.ephemeral_vault.to_account_info(),
             magic_program: ctx.accounts.magic_program.to_account_info(),
             permission_program: ctx.accounts.permission_program.to_account_info(),
-            args: members_args(true, &owner, &viewers),
+            args: members_args(true, &owner, ctx.accounts.position.session_key, &viewers),
         }
         .invoke_signed(&[signer_seeds])?;
 
@@ -507,8 +527,10 @@ pub mod agama_magicblock {
         is_private: bool,
         viewers: Vec<Pubkey>,
     ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        assert_may_act(&ctx.accounts.position, ctx.accounts.signer.key, now)?;
         require!(
-            viewers.len() + 1 <= MAX_PERMISSION_MEMBERS,
+            viewers.len() + 2 <= MAX_PERMISSION_MEMBERS,
             AgamaError::TooManyMembers
         );
         let owner = ctx.accounts.position.owner;
@@ -524,7 +546,7 @@ pub mod agama_magicblock {
             permission_program: ctx.accounts.permission_program.to_account_info(),
             authority: ctx.accounts.position.to_account_info(),
             authority_is_signer: false,
-            args: members_args(is_private, &owner, &viewers),
+            args: members_args(is_private, &owner, ctx.accounts.position.session_key, &viewers),
         }
         .invoke_signed(&[signer_seeds])?;
 
@@ -534,6 +556,8 @@ pub mod agama_magicblock {
 
     /// Drop the permission and refund its rent to the position.
     pub fn close_permission(ctx: Context<PermissionCtx>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        assert_may_act(&ctx.accounts.position, ctx.accounts.signer.key, now)?;
         let owner = ctx.accounts.position.owner;
         let bump = [ctx.accounts.position.bump];
         let signer_seeds: &[&[u8]] = &[POSITION_SEED, owner.as_ref(), &bump];
@@ -562,6 +586,7 @@ pub mod agama_magicblock {
     /// derivable without ever storing a public deposit trail.
     pub fn sync_position(ctx: Context<SyncPosition>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
+        assert_may_act(&ctx.accounts.position, ctx.accounts.signer.key, now)?;
         let supply = ctx.accounts.vault.shares;
         // The book lives on the public rollup, this instruction runs on the TEE
         // one, so here it is a base-layer clone owned by the delegation program.
@@ -644,6 +669,31 @@ fn nav_for_pricing(vault: &Account<Vault>, book: &PoolBook) -> Result<u64> {
     Ok(book.nav.saturating_add(unmarked).saturating_sub(unreturned))
 }
 
+/// Who is allowed to act on a position inside the rollup.
+///
+/// The owner's wallet cannot be the answer. Wallets refuse to sign an Ephemeral
+/// Rollup transaction outright: Phantom inspects the blockhash, fails to place it
+/// on any cluster it knows, decides the transaction is for mainnet, and offers no
+/// approve button at all. So the owner authorises a browser-held session key once,
+/// on the base layer, in the same transaction as their deposit, and that key signs
+/// everything that happens on the rollup afterwards.
+///
+/// The session key can read and mark the position. It cannot move a single token:
+/// deposits, redemptions and custody all live on Solana, where only the wallet
+/// signs.
+fn assert_may_act(position: &Position, signer: &Pubkey, now: i64) -> Result<()> {
+    if signer == &position.owner {
+        return Ok(());
+    }
+    require!(
+        signer == &position.session_key
+            && position.session_key != Pubkey::default()
+            && now < position.session_expiry,
+        AgamaError::Unauthorized
+    );
+    Ok(())
+}
+
 /// Read the pool book from an account that may or may not be delegated.
 ///
 /// Once the book is delegated, Solana reports it as owned by the delegation
@@ -670,12 +720,25 @@ fn read_book(info: &UncheckedAccount) -> Result<PoolBook> {
     PoolBook::deserialize(&mut slice).map_err(|_| error!(AgamaError::BadBookOwner))
 }
 
-fn members_args(is_private: bool, owner: &Pubkey, viewers: &[Pubkey]) -> EphemeralMembersArgs {
-    let mut members = Vec::with_capacity(viewers.len() + 1);
+fn members_args(
+    is_private: bool,
+    owner: &Pubkey,
+    session_key: Pubkey,
+    viewers: &[Pubkey],
+) -> EphemeralMembersArgs {
+    let mut members = Vec::with_capacity(viewers.len() + 2);
     members.push(Member {
         flags: OWNER_FLAGS,
         pubkey: *owner,
     });
+    // The session key reads with its own login token, so it has to be on the list
+    // or the browser cannot show the owner their own position.
+    if session_key != Pubkey::default() {
+        members.push(Member {
+            flags: VIEWER_FLAGS,
+            pubkey: session_key,
+        });
+    }
     for v in viewers {
         members.push(Member {
             flags: VIEWER_FLAGS,
@@ -808,6 +871,10 @@ pub struct Position {
     /// Mirrors whether an EphemeralPermission is gating this account on the ER.
     pub is_private: bool,
     pub bump: u8,
+    /// Browser-held key allowed to act on this position inside the rollup. Set on
+    /// the base layer by the owner; worthless anywhere else.
+    pub session_key: Pubkey,
+    pub session_expiry: i64,
 }
 
 #[account]
@@ -1010,6 +1077,18 @@ pub struct DelegateBook<'info> {
 }
 
 #[derive(Accounts)]
+pub struct AuthorizeSession<'info> {
+    #[account(mut, address = position.owner @ AgamaError::Unauthorized)]
+    pub owner: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [POSITION_SEED, owner.key().as_ref()],
+        bump = position.bump
+    )]
+    pub position: Account<'info, Position>,
+}
+
+#[derive(Accounts)]
 pub struct PrepareForRollup<'info> {
     #[account(mut)]
     pub owner: Signer<'info>,
@@ -1086,8 +1165,11 @@ pub struct CommitPosition<'info> {
 
 #[derive(Accounts)]
 pub struct PermissionCtx<'info> {
-    #[account(mut, address = position.owner @ AgamaError::Unauthorized)]
-    pub owner: Signer<'info>,
+    /// The owner's wallet, or the session key it authorised. Checked in the
+    /// handler by `assert_may_act`, because Anchor cannot express "one of these
+    /// two" as a constraint.
+    #[account(mut)]
+    pub signer: Signer<'info>,
     #[account(
         mut,
         seeds = [POSITION_SEED, position.owner.as_ref()],
@@ -1115,17 +1197,19 @@ pub struct PermissionCtx<'info> {
 
 #[derive(Accounts)]
 pub struct SyncPosition<'info> {
-    /// Not writable: this instruction moves no lamports, and marking a
-    /// non-delegated base-layer account writable inside a rollup transaction is
-    /// what starts failing the moment something other than the owner pays the fee.
-    #[account(address = position.owner @ AgamaError::Unauthorized)]
-    pub owner: Signer<'info>,
+    /// The owner's wallet, or the session key it authorised. Not writable: this
+    /// instruction moves no lamports.
+    pub signer: Signer<'info>,
     #[account(
         mut,
         seeds = [POSITION_SEED, position.owner.as_ref()],
         bump = position.bump
     )]
     pub position: Account<'info, Position>,
+    /// CHECK: pinned to the position's owner; only used to derive their agYLD
+    /// account, which is what the enclave reads to learn the share balance.
+    #[account(address = position.owner @ AgamaError::Unauthorized)]
+    pub owner: UncheckedAccount<'info>,
     #[account(seeds = [VAULT_SEED], bump = vault.bump)]
     pub vault: Account<'info, Vault>,
     /// CHECK: read-only, and delegated to a different rollup. See `read_book`.

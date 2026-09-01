@@ -47,7 +47,8 @@ export const PROGRAM_ID = new PublicKey("GVHsSaFUkVAZJdRKWtK1SxYUhW2P7a7z1xBL5Sa
 
 export const VAULT_SEED = Buffer.from("agama-vault");
 export const BOOK_SEED = Buffer.from(BOOK_SEED_NAME);
-export const POSITION_SEED = Buffer.from("position");
+// Bumped with the layout when positions gained a session key.
+export const POSITION_SEED = Buffer.from("position-v2");
 export const USDC_SEED = Buffer.from("usdc-mint");
 export const AGYLD_SEED = Buffer.from("agyld-mint");
 

@@ -49,6 +49,8 @@ programs/agama-magicblock/src/lib.rs
 | `deposit` | USDC in, agYLD out at the current share price |
 | `redeem` | agYLD burned, USDC out at the current share price |
 | `init_position` | Opens a position ledger, pre-funded for its permission rent |
+| `authorize_session` | Lets a browser-held key act on the position inside the rollup |
+| `prepare_for_rollup` | Tops the ledger and the agYLD account up to the clone floor |
 | `delegate_book` / `delegate_position` | Hands an account to the TEE validator |
 
 **Ephemeral rollup**
@@ -280,6 +282,24 @@ the only place left.**
 after the on-chain work succeeded. `sendAndPoll` in `scripts/common.ts` sends and
 polls `getSignatureStatuses` instead, which also surfaces the real program error
 when there is one.
+
+**5b. A wallet will not sign a rollup transaction at all.** Not "warns about", not
+"asks twice". Phantom inspects the transaction, cannot place its blockhash on any
+cluster it knows, decides it is for mainnet, and renders a Network mismatch panel
+whose only button is Close. There is nothing to approve.
+
+So the owner authorises a browser-held session key once, on the base layer, in the
+same transaction as their deposit, and that key signs everything that happens on
+the rollup: the enclave login, the permission, the position marks. That takes a
+private deposit from three wallet prompts, one of which was impossible to satisfy,
+to a single approval. Later deposits are one approval with no rollup leg at all.
+
+The key can read and re-mark a position. It cannot move a token: custody, minting
+and redemption all live on Solana, where only the wallet signs. It is stored in
+localStorage, expires in seven days, and losing it costs a click.
+
+Note that it also has to be a member of the `EphemeralPermission`, because it reads
+with its own login token, and a token minted for a non-member sees nothing.
 
 **6. Permission rent has no headroom on the grow path.** `EphemeralPermission::size_of(n)`
 is `35 + (1 + n) * 33`, and `rent(bytes)` is `(bytes + 60) * 32` lamports. A
