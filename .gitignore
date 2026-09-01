@@ -1,0 +1,12 @@
+.anchor
+.DS_Store
+target
+**/*.rs.bk
+node_modules
+test-ledger
+.yarn
+.surfpool
+
+# Local mb-stack state. Ledger data and a validator keypair, none of it reproducible
+# or worth publishing.
+magicblock-test-storage

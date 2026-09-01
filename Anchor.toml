@@ -1,0 +1,25 @@
+[toolchain]
+package_manager = "yarn"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+agama_magicblock = "GVHsSaFUkVAZJdRKWtK1SxYUhW2P7a7z1xBL5SaFj5vC"
+
+[programs.devnet]
+agama_magicblock = "GVHsSaFUkVAZJdRKWtK1SxYUhW2P7a7z1xBL5SaFj5vC"
+
+[provider]
+# Solana devnet, reached through MagicBlock's RPC so deploys and ER lookups agree
+# on which cluster we are talking about.
+cluster = "https://rpc.magicblock.app/devnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "cargo test"
+setup = "npx tsx scripts/setup.ts"
+keeper = "npx tsx scripts/keeper.ts"
+
+[hooks]
