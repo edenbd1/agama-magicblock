@@ -38,6 +38,7 @@ import {
   deriveVault,
   deriveVaultAta,
   initEphemeralAtaIx,
+  transferSpl,
   transferToVaultIx,
 } from "@magicblock-labs/ephemeral-rollups-sdk";
 import { TEE_VALIDATOR, bookPda, exitsPda, shieldedPda, usdcMint, vaultPda } from "./common";
@@ -214,4 +215,44 @@ export async function rotateSessionIxs(
     })
     .instruction();
   return [verify, rotate];
+}
+
+// ------------------------------------------------ encrypted-destination shield
+//
+// The plain shield above puts wallet -> throwaway key in a public transfer. This
+// variant hides that link. The wallet sends a MagicBlock private transfer whose
+// destination is encrypted to the TEE validator's key, so the throwaway key
+// appears nowhere in the base transaction; the queue delivers it after a random
+// delay, optionally in parts, from MagicBlock's queue vault. The key then
+// shields what it received into its own private eATA. It holds no SOL (sending
+// it some would recreate the link), so a sponsor pays that transaction's fees and
+// rent, and signs nothing else.
+
+/// Base layer, signed by the wallet. Destination encrypted, delivery delayed.
+export async function encryptedSendIxs(
+  wallet: PublicKey,
+  shieldKey: PublicKey,
+  amount: bigint,
+  opts: { minDelayMs?: bigint; maxDelayMs?: bigint; split?: number } = {},
+): Promise<TransactionInstruction[]> {
+  return transferSpl(wallet, shieldKey, usdcMint, amount, {
+    visibility: "private",
+    fromBalance: "base",
+    toBalance: "base",
+    validator: TEE_VALIDATOR,
+    privateTransfer: { minDelayMs: opts.minDelayMs ?? 5_000n, maxDelayMs: opts.maxDelayMs ?? 30_000n, split: opts.split ?? 2 },
+  });
+}
+
+/// Base layer, signed by the shield key (as token owner) and the sponsor (fees,
+/// rent). Moves what the key received into its private eATA on the TEE.
+export function sponsoredShieldIxs(shieldKey: PublicKey, sponsor: PublicKey, amount: bigint): TransactionInstruction[] {
+  const [eata] = deriveEphemeralAta(shieldKey, usdcMint);
+  const [gvault] = deriveVault(usdcMint);
+  return [
+    initEphemeralAtaIx(eata, shieldKey, usdcMint, sponsor),
+    transferToVaultIx(eata, gvault, usdcMint, ata(shieldKey), deriveVaultAta(usdcMint, gvault), shieldKey, amount),
+    createEataPermissionIx(eata, sponsor),
+    delegateEphemeralAtaIx(sponsor, eata, TEE_VALIDATOR),
+  ];
 }

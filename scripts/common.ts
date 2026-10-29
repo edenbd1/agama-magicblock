@@ -70,6 +70,13 @@ export const [exitsPda] = PublicKey.findProgramAddressSync([EXITS_SEED, vaultPda
 /// The operator key that owns Agama's private USDC custody (an eATA delegated to
 /// the TEE). A key and not a PDA because the enclave will not hand a private
 /// eATA to the Agama program, so a PDA could never sign for it.
+/// Pays fees and rent for a shield key's own shield, so the key never needs SOL
+/// from the wallet it is meant to be unlinked from.
+export function loadSponsorKeypair(): Keypair {
+  const p = process.env.SPONSOR_KEYPAIR ?? path.join(__dirname, "..", ".keys", "sponsor.json");
+  return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(p, "utf8"))));
+}
+
 export function loadCustodyKeypair(): Keypair {
   const p = process.env.CUSTODY_KEYPAIR ?? path.join(__dirname, "..", ".keys", "private-custody.json");
   return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(p, "utf8"))));

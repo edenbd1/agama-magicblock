@@ -2,8 +2,12 @@
 //
 //   [1] fund the wallet, get test USDC
 //   [2] open a private position: no amount anywhere in this transaction
-//   [3] shield: wallet -> throwaway key -> MagicBlock's Global Vault. One wallet
-//       approval, and no Agama instruction in it
+//   [3] shield: wallet -> throwaway key -> MagicBlock's Global Vault, with no
+//       Agama instruction in it. By default the wallet's leg is a MagicBlock
+//       private transfer with the key encrypted to the TEE, delivered after a
+//       random delay in two parts, and a sponsor pays the key's own shield, so no
+//       public transaction holds both the wallet and the key. SHIELD=plain uses
+//       the direct transfer instead.
 //   [4] inside the enclave: seal the position, transfer into the private
 //       custody, credit private shares
 //   [5] what each reader sees: owner, stranger, anonymous, and Solana itself
@@ -35,6 +39,7 @@ import {
   exitsPda,
   loadCustodyKeypair,
   loadKeypair,
+  loadSponsorKeypair,
   positionPda,
   programFor,
   sendAndPoll,
@@ -44,7 +49,18 @@ import {
   vaultPda,
 } from "./common";
 import nacl from "tweetnacl";
-import { ata, depositPrivateIxs, payExitIxs, randomGroupId, redeemPrivateIx, rotateSessionIxs, sessionMessage, shieldIxs } from "./private";
+import {
+  ata,
+  depositPrivateIxs,
+  encryptedSendIxs,
+  payExitIxs,
+  randomGroupId,
+  redeemPrivateIx,
+  rotateSessionIxs,
+  sessionMessage,
+  shieldIxs,
+  sponsoredShieldIxs,
+} from "./private";
 
 const DELEGATION_PROGRAM_ID = new PublicKey("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
 const DEPOSIT = 300_000_000n;
@@ -153,10 +169,44 @@ async function main() {
   ), [wallet]);
   console.log("      ", openSig);
 
-  step("[3]", `shield ${usdc(DEPOSIT)} USDC: wallet -> throwaway key -> MagicBlock Global Vault`);
-  const shieldSig = await sendAndPoll(base, new Transaction().add(...shieldIxs(wallet.publicKey, shieldKey.publicKey, DEPOSIT)), [wallet, shieldKey]);
-  console.log("      ", shieldSig);
-  console.log("       programs it touched:", named(await programsIn(base, shieldSig)));
+  const sponsor = loadSponsorKeypair();
+  const keysIn = async (sig: string): Promise<string[]> => {
+    const r: any = await fetch(BASE_RPC, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getTransaction", params: [sig, { encoding: "json", commitment: "confirmed", maxSupportedTransactionVersion: 1 }] }),
+    }).then((x) => x.json());
+    return r?.result?.transaction?.message?.accountKeys ?? [];
+  };
+  /// Get `amount` into `key`'s private eATA on the TEE, without a public
+  /// transaction that names both the wallet and the key.
+  const shield = async (key: Keypair, amount: bigint) => {
+    if (process.env.SHIELD === "plain") {
+      const sig = await sendAndPoll(base, new Transaction().add(...shieldIxs(wallet.publicKey, key.publicKey, amount)), [wallet, key]);
+      console.log("       shield (plain)", sig, "\n       programs it touched:", named(await programsIn(base, sig)));
+      return;
+    }
+    const sendSig = await sendAndPoll(base, new Transaction().add(...(await encryptedSendIxs(wallet.publicKey, key.publicKey, amount, { minDelayMs: 2000n, maxDelayMs: 8000n, split: 2 }))), [wallet]);
+    const sendKeys = await keysIn(sendSig);
+    console.log("       wallet's private send ", sendSig);
+    console.log(`         names the key: ${sendKeys.includes(key.publicKey.toBase58()) || sendKeys.includes(ata(key.publicKey).toBase58()) ? "YES" : "no"}   programs: ${named(await programsIn(base, sendSig))}`);
+    const t0 = Date.now();
+    for (let i = 0; ; i++) {
+      const got = await base.getTokenAccountBalance(ata(key.publicKey)).then((r) => BigInt(r.value.amount)).catch(() => 0n);
+      if (got >= amount) break;
+      if (i >= 60) throw new Error("the queue never delivered");
+      await sleep(2000);
+    }
+    const deliveries = await base.getSignaturesForAddress(ata(key.publicKey), { limit: 10 });
+    console.log(`         delivered to the key after ~${Math.round((Date.now() - t0) / 1000)}s in ${deliveries.length} part(s), from MagicBlock's queue`);
+    const shieldSig = await sendAndPoll(base, new Transaction().add(...sponsoredShieldIxs(key.publicKey, sponsor.publicKey, amount)), [sponsor, key]);
+    const shieldKeys = await keysIn(shieldSig);
+    console.log("       key's sponsored shield", shieldSig);
+    console.log(`         names the wallet: ${shieldKeys.includes(wallet.publicKey.toBase58()) ? "YES" : "no"}   programs: ${named(await programsIn(base, shieldSig))}`);
+  };
+
+  step("[3]", `shield ${usdc(DEPOSIT)} USDC into a throwaway key's private eATA`);
+  await shield(shieldKey, DEPOSIT);
 
   step("[4]", "inside the enclave: seal the position, deposit privately");
   let teeUrl: string | null = null;
@@ -199,6 +249,20 @@ async function main() {
   const pos: any = await er.account.position.fetch(position);
   console.log(`       private shares ${usdc(pos.privateShares)}  value ${usdc(pos.valueUsdc)}  entry ${usdc(pos.entryPrice)}  agYLD 0`);
 
+  step("[4b]", "a second private deposit from the same wallet");
+  const key2 = Keypair.generate();
+  await shield(key2, 50_000_000n);
+  for (let i = 0; i < 20; i++) {
+    const b: any = await (await authedConnectionTo(TEE_RPC, key2)).getTokenAccountBalance(ata(key2.publicKey)).catch(() => null);
+    if (b?.value?.amount === "50000000") break;
+    await sleep(2000);
+  }
+  console.log("       deposit", await sendAndPoll(teeS, new Transaction().add(...(await depositPrivateIxs(er, {
+    shieldKey: key2.publicKey, signer: session.publicKey, position, custodyOwner: custody.publicKey, amount: 50_000_000n,
+  }))), [session, key2]));
+  const posB: any = await er.account.position.fetch(position);
+  console.log(`       private shares ${usdc(pos.privateShares)} -> ${usdc(posB.privateShares)}`);
+
   step("[5]", "who can see what");
   const strangerConn = await authedConnectionTo(teeUrl, stranger);
   const custodyAsStranger: any = await strangerConn.getTokenAccountBalance(ata(custody.publicKey)).catch(() => null);
@@ -229,7 +293,7 @@ async function main() {
     [stranger], "Unauthorized");
 
   step("[7]", "redeem half privately");
-  const half = new BN(pos.privateShares.toString()).divn(2);
+  const half = new BN(posB.privateShares.toString()).divn(2);
   const groupId = randomGroupId();
   const walletBefore = BigInt((await base.getTokenAccountBalance(ata(wallet.publicKey))).value.amount);
   const thief = Keypair.generate();
