@@ -274,7 +274,7 @@ contract on an EVM chain is a PDA of a single program here. Everything below is 
 |---|---|---|
 | Program | `GVHsSaFUkVAZJdRKWtK1SxYUhW2P7a7z1xBL5SaFj5vC` | 20 instructions, upgradeable |
 | Vault | `RzouyB4AkAiBP1JvYUmNoEPpK8x77p2hMRAh27NJj6M` | PDA `[agama-vault]`. Mint authority and share accounting |
-| Pool book | `G164MeGadQebj5zMipbEAm5ssCqoRfjUdiwjpexTCqaU` | PDA `[lending-book-v2, vault]`. The four pools. Delegated. The legacy `[lending-book, vault]` at `y7QJ…XRUTY`… is orphaned, see #9 |
+| Pool book | `G164MeGadQebj5zMipbEAm5ssCqoRfjUdiwjpexTCqaU` | PDA `[lending-book-v2, vault]`. The four pools. Delegated. The legacy `[lending-book, vault]` at `y7QJuSwhnEvA6JLs5uiHWmpbYi2GHtJ6QmMENnv6b6x` is orphaned, see #9 |
 | agYLD mint | `5v2dRhbcEBWH5YUapkeQV9d3C84Ek4P8hH7tfWPxWCPA` | PDA `[agyld-mint]`, 6 decimals |
 | Test USDC mint | `DuiuxGrD1iQJnuZKw1muqDgYRaV2QGvcqymM8ay4gy4Q` | PDA `[usdc-mint]`, 6 decimals |
 | USDC custody | `ehxmrwjm5WoCMoh3KEe8WwXY35mj5oFbGRcJYF1qiyN` | The vault's ATA, where the collateral sits |
