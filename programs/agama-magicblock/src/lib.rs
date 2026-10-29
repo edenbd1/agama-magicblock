@@ -18,16 +18,36 @@
 //                       that committed NAV is what base-layer deposits price on.
 //
 //   Private ER (TEE)    Per-depositor Position accounts, gated by an ER-local
-//                       EphemeralPermission. The public chain shows an agYLD
-//                       balance; entry price, marked value and accrued yield are
-//                       readable only by the owner and whoever they admit
-//                       (an auditor, a fund administrator).
+//                       EphemeralPermission: entry price, marked value and
+//                       accrued yield, readable only by the owner and whoever
+//                       they admit (an auditor, a fund administrator).
+//
+//                       And a fully private way in and out. USDC is shielded
+//                       through MagicBlock's Ephemeral SPL Token program by a
+//                       throwaway key, so Solana sees a deposit into MagicBlock,
+//                       not into Agama. Inside the enclave it moves into Agama's
+//                       private custody and is credited as *private shares* on
+//                       the Position: no agYLD is minted, no event is emitted.
+//                       Redemptions leave through MagicBlock's private transfer
+//                       queue straight to the owner's wallet. Solana only ever
+//                       sees the aggregate (`Shielded`), committed in batches.
+//
+//                       One constraint shapes all of it: the TEE's query filter
+//                       refuses any transaction that hands a private eATA to a
+//                       program other than SPL Token or MagicBlock's own. So
+//                       this program never touches a token account in there.
+//                       It checks, by instruction introspection, that the
+//                       transfer it is about to credit really sits next to it in
+//                       the same transaction.
 //
 // This is hardware-verified confidentiality (Intel TDX), not zero-knowledge. The
 // trust assumption is the enclave, and it is stated as such.
 use anchor_lang::prelude::*;
 use anchor_lang::system_program::{transfer as system_transfer, Transfer as SystemTransfer};
 use anchor_spl::associated_token::AssociatedToken;
+use anchor_lang::solana_program::instruction::Instruction;
+use solana_instructions_sysvar::{load_current_index_checked, load_instruction_at_checked};
+use anchor_spl::associated_token::get_associated_token_address;
 use anchor_spl::token::{
     burn, mint_to, transfer_checked, Burn, Mint, MintTo, Token, TokenAccount, TransferChecked,
 };
@@ -49,10 +69,28 @@ declare_id!("GVHsSaFUkVAZJdRKWtK1SxYUhW2P7a7z1xBL5SaFj5vC");
 
 pub const VAULT_SEED: &[u8] = b"agama-vault";
 pub const BOOK_SEED: &[u8] = b"lending-book";
-pub const POSITION_SEED: &[u8] = b"position-v2";
+/// v3: positions now carry private shares. v2 ledgers are left where they are.
+pub const POSITION_SEED: &[u8] = b"position-v3";
+/// v2: the custody is owned by an operator key, recorded here. See `Shielded`.
+pub const SHIELDED_V2_SEED: &[u8] = b"shielded-v2";
+/// Pending private redemptions, waiting for the custody to pay them.
+pub const EXITS_SEED: &[u8] = b"exits";
+pub const EXIT_SLOTS: usize = 16;
 pub const USDC_SEED: &[u8] = b"usdc-mint";
 pub const AGYLD_SEED: &[u8] = b"agyld-mint";
 pub const CLAIM_SEED: &[u8] = b"faucet-claim";
+
+/// MagicBlock's Ephemeral SPL Token program (MIMD 0013): eATAs, the per-mint
+/// Global Vault, and the private transfer queue redemptions leave through.
+pub const EPHEMERAL_SPL_TOKEN_PROGRAM_ID: Pubkey =
+    pubkey!("SPLxh1LVZzEkX99H6rqYizhytLWPZVV296zyYDPagv2");
+/// `DepositAndQueueTransfer` in that program.
+const ESPL_DEPOSIT_AND_QUEUE_TRANSFER: u8 = 16;
+/// SPL Token `Transfer` and `TransferChecked`.
+const SPL_TRANSFER: u8 = 3;
+const SPL_TRANSFER_CHECKED: u8 = 12;
+/// Upper bound on the random delay a private redemption may ask for.
+pub const MAX_EXIT_DELAY_MS: u64 = 24 * 3600 * 1000;
 
 pub const POOL_COUNT: usize = 4;
 pub const DECIMALS: u8 = 6;
@@ -170,8 +208,8 @@ pub mod agama_magicblock {
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         require!(amount > 0, AgamaError::ZeroAmount);
         let book = read_book(&ctx.accounts.book)?;
-        let nav = nav_for_pricing(&ctx.accounts.vault, &book)?;
-        let supply = ctx.accounts.vault.shares;
+        let shielded = read_shielded(&ctx.accounts.shielded)?;
+        let (nav, supply) = nav_for_pricing(&ctx.accounts.vault, &book, &shielded)?;
 
         let shares = if supply == 0 || nav == 0 {
             amount
@@ -227,9 +265,9 @@ pub mod agama_magicblock {
     pub fn redeem(ctx: Context<Redeem>, shares: u64) -> Result<()> {
         require!(shares > 0, AgamaError::ZeroAmount);
         let book = read_book(&ctx.accounts.book)?;
-        let nav = nav_for_pricing(&ctx.accounts.vault, &book)?;
-        let supply = ctx.accounts.vault.shares;
-        require!(supply >= shares, AgamaError::InsufficientShares);
+        let shielded = read_shielded(&ctx.accounts.shielded)?;
+        let (nav, supply) = nav_for_pricing(&ctx.accounts.vault, &book, &shielded)?;
+        require!(ctx.accounts.vault.shares >= shares, AgamaError::InsufficientShares);
 
         let assets = u64::try_from(shares as u128 * nav as u128 / supply as u128)
             .map_err(|_| AgamaError::MathOverflow)?;
@@ -305,6 +343,7 @@ pub mod agama_magicblock {
         position.vault = ctx.accounts.vault.key();
         position.bump = ctx.bumps.position;
         position.shares = 0;
+        position.private_shares = 0;
         position.entry_price = ONE;
         position.value_usdc = 0;
         position.cost_basis = 0;
@@ -350,10 +389,11 @@ pub mod agama_magicblock {
     /// rent-exempt minimum. Separate from `init_position` on purpose: only a
     /// depositor who actually wants a private ledger should pay for one.
     pub fn prepare_for_rollup(ctx: Context<PrepareForRollup>) -> Result<()> {
-        for account in [
-            ctx.accounts.position.to_account_info(),
-            ctx.accounts.owner_agyld.to_account_info(),
-        ] {
+        let mut accounts = vec![ctx.accounts.position.to_account_info()];
+        if let Some(agyld) = &ctx.accounts.owner_agyld {
+            accounts.push(agyld.to_account_info());
+        }
+        for account in accounts {
             let have = account.lamports();
             if have >= ROLLUP_CLONE_FLOOR {
                 continue;
@@ -378,6 +418,83 @@ pub mod agama_magicblock {
         ctx.accounts.delegate_position(
             &ctx.accounts.owner,
             &[POSITION_SEED, ctx.accounts.owner.key().as_ref()],
+            DelegateConfig {
+                validator: ctx.accounts.validator.as_ref().map(|v| v.key()),
+                ..Default::default()
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Open the private side of the vault: the aggregate of every private
+    /// position, which is all Solana ever learns about them.
+    ///
+    /// Pre-funded for its own permission rent and for the rollup's clone floor,
+    /// for the same reason a Position is: once delegated, it cannot be topped up
+    /// from the base layer.
+    pub fn init_shielded(ctx: Context<InitShielded>, custody_owner: Pubkey) -> Result<()> {
+        let floor = ROLLUP_CLONE_FLOOR.saturating_add(ephemeral_rollups_sdk::ephemeral_accounts::rent(
+            EphemeralPermission::size_of(2) as u32,
+        ));
+        let have = ctx.accounts.shielded.to_account_info().lamports();
+        if have < floor {
+            system_transfer(
+                CpiContext::new(
+                    ctx.accounts.system_program.key(),
+                    SystemTransfer {
+                        from: ctx.accounts.authority.to_account_info(),
+                        to: ctx.accounts.shielded.to_account_info(),
+                    },
+                ),
+                floor - have,
+            )?;
+        }
+        let have = ctx.accounts.exits.to_account_info().lamports();
+        if have < floor {
+            system_transfer(
+                CpiContext::new(
+                    ctx.accounts.system_program.key(),
+                    SystemTransfer {
+                        from: ctx.accounts.authority.to_account_info(),
+                        to: ctx.accounts.exits.to_account_info(),
+                    },
+                ),
+                floor - have,
+            )?;
+        }
+        ctx.accounts.exits.vault = ctx.accounts.vault.key();
+
+        let shielded = &mut ctx.accounts.shielded;
+        shielded.vault = ctx.accounts.vault.key();
+        shielded.custody_owner = custody_owner;
+        shielded.shares = 0;
+        shielded.total_in = 0;
+        shielded.total_out = 0;
+        shielded.bump = ctx.bumps.shielded;
+        Ok(())
+    }
+
+    /// Hand the private aggregate to the TEE validator. Called again whenever
+    /// the keeper recycles it, so it does not touch the exit book.
+    pub fn delegate_shielded(ctx: Context<DelegateShielded>) -> Result<()> {
+        let vault = ctx.accounts.vault.key();
+        ctx.accounts.delegate_shielded(
+            &ctx.accounts.payer,
+            &[SHIELDED_V2_SEED, vault.as_ref()],
+            DelegateConfig {
+                validator: ctx.accounts.validator.as_ref().map(|v| v.key()),
+                ..Default::default()
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Hand the exit book to the TEE validator. Once: it is never committed.
+    pub fn delegate_exits(ctx: Context<DelegateExits>) -> Result<()> {
+        let vault = ctx.accounts.vault.key();
+        ctx.accounts.delegate_exits(
+            &ctx.accounts.payer,
+            &[EXITS_SEED, vault.as_ref()],
             DelegateConfig {
                 validator: ctx.accounts.validator.as_ref().map(|v| v.key()),
                 ..Default::default()
@@ -587,44 +704,286 @@ pub mod agama_magicblock {
     pub fn sync_position(ctx: Context<SyncPosition>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         assert_may_act(&ctx.accounts.position, ctx.accounts.signer.key, now)?;
-        let supply = ctx.accounts.vault.shares;
         // The book lives on the public rollup, this instruction runs on the TEE
         // one, so here it is a base-layer clone owned by the delegation program.
         // Positions therefore mark against the last committed NAV, which is the
         // right granularity for a position ledger.
         let book = read_book(&ctx.accounts.book)?;
-        let nav = nav_for_pricing(&ctx.accounts.vault, &book)?;
-        let price = if supply == 0 {
-            ONE
-        } else {
-            u64::try_from(nav as u128 * ONE as u128 / supply as u128)
-                .map_err(|_| AgamaError::MathOverflow)?
-        };
+        let (nav, supply) = nav_for_pricing(&ctx.accounts.vault, &book, &ctx.accounts.shielded)?;
+        let price = share_price(nav, supply)?;
 
         let position = &mut ctx.accounts.position;
-        let held = ctx.accounts.owner_agyld.amount;
+        // A fully private depositor has no agYLD account at all.
+        let held = ctx.accounts.owner_agyld.as_ref().map(|a| a.amount).unwrap_or(0);
 
-        // Averaging in only makes sense when shares actually arrived. Guarding the
-        // zero case also keeps a replayed sync from re-blending an entry price.
-        if held > 0 && held > position.shares {
-            // Averaging in: blend the new shares at today's price.
+        // Averaging in only makes sense when public shares actually arrived.
+        // Guarding the zero case also keeps a replayed sync from re-blending an
+        // entry price. Private shares are blended at the moment they are minted,
+        // in `deposit_private`, so only the public leg is caught up here.
+        if held > position.shares {
             let added = held - position.shares;
-            let blended = (position.entry_price as u128 * position.shares as u128
-                + price as u128 * added as u128)
-                / held as u128;
-            position.entry_price = u64::try_from(blended).map_err(|_| AgamaError::MathOverflow)?;
+            blend_entry(position, added, price)?;
         }
         // Averaging out leaves the entry price alone: the exit realises P&L, it
         // does not re-mark what is left behind.
-
         position.shares = held;
-        position.value_usdc = u64::try_from(held as u128 * price as u128 / ONE as u128)
+        mark(position, price, now)
+    }
+
+    // ------------------------------------------------- private deposits (TEE)
+
+    /// Gate the private aggregate and the exit book so only the vault authority
+    /// can read them live.
+    ///
+    /// Ungated, anyone logged in to the enclave could watch `total_in` move and
+    /// read every private deposit off the difference, or read the exit book and
+    /// learn who is redeeming how much. Gated, the aggregate reaches the public
+    /// only through `commit_shielded`, which batches whatever arrived since the
+    /// last commit into one number, and the exit book never reaches it at all.
+    ///
+    /// Gating stops reads, not writes: depositors still update both accounts
+    /// through this program without being members.
+    pub fn init_shielded_permission(ctx: Context<ShieldedPermission>) -> Result<()> {
+        let vault = ctx.accounts.vault.key();
+        let members = || EphemeralMembersArgs {
+            is_private: true,
+            members: vec![Member {
+                flags: OWNER_FLAGS,
+                pubkey: ctx.accounts.authority.key(),
+            }],
+        };
+        let created = |p: &UncheckedAccount| p.owner == &PERMISSION_PROGRAM_ID && !p.data_is_empty();
+
+        if !created(&ctx.accounts.permission) {
+            let bump = [ctx.accounts.shielded.bump];
+            let seeds: &[&[u8]] = &[SHIELDED_V2_SEED, vault.as_ref(), &bump];
+            CreateEphemeralPermissionCpi {
+                payer: ctx.accounts.shielded.to_account_info(),
+                permissioned_account: ctx.accounts.shielded.to_account_info(),
+                permission: ctx.accounts.permission.to_account_info(),
+                vault: ctx.accounts.ephemeral_vault.to_account_info(),
+                magic_program: ctx.accounts.magic_program.to_account_info(),
+                permission_program: ctx.accounts.permission_program.to_account_info(),
+                args: members(),
+            }
+            .invoke_signed(&[seeds])?;
+        }
+        if !created(&ctx.accounts.exits_permission) {
+            let bump = [ctx.bumps.exits];
+            let seeds: &[&[u8]] = &[EXITS_SEED, vault.as_ref(), &bump];
+            CreateEphemeralPermissionCpi {
+                payer: ctx.accounts.exits.to_account_info(),
+                permissioned_account: ctx.accounts.exits.to_account_info(),
+                permission: ctx.accounts.exits_permission.to_account_info(),
+                vault: ctx.accounts.ephemeral_vault.to_account_info(),
+                magic_program: ctx.accounts.magic_program.to_account_info(),
+                permission_program: ctx.accounts.permission_program.to_account_info(),
+                args: members(),
+            }
+            .invoke_signed(&[seeds])?;
+        }
+        Ok(())
+    }
+
+    /// Credit private shares for shielded USDC. Runs inside the enclave.
+    ///
+    /// Before this, `depositor` (a throwaway key the browser made for this one
+    /// deposit) shielded the USDC through MagicBlock's Ephemeral SPL Token
+    /// program, so the base layer saw a deposit into MagicBlock's Global Vault
+    /// and nothing that mentions Agama.
+    ///
+    /// The instruction right before this one, in the same transaction, must be
+    /// an SPL Token transfer of exactly `amount`, from the depositor's account to
+    /// the private custody, signed by the depositor. This program cannot make that
+    /// transfer itself (the enclave refuses to hand it a private eATA), so it
+    /// reads it instead, and credits nothing unless it is there. Two deposits
+    /// cannot share one transfer: each looks only at its own predecessor.
+    ///
+    /// No agYLD is minted and no event is emitted. The only trace this leaves
+    /// outside the enclave is a larger `shielded.total_in` at the next batched
+    /// commit. Priced exactly like a public deposit, against both custodies and
+    /// the full share supply, so the two kinds of share are always worth the same.
+    pub fn deposit_private(ctx: Context<DepositPrivate>, amount: u64) -> Result<()> {
+        require!(amount > 0, AgamaError::ZeroAmount);
+        let now = Clock::get()?.unix_timestamp;
+        assert_may_act(&ctx.accounts.position, ctx.accounts.signer.key, now)?;
+
+        let usdc = ctx.accounts.vault.usdc_mint;
+        let prev = previous_instruction(&ctx.accounts.instructions)?;
+        assert_token_transfer(
+            &prev,
+            amount,
+            &get_associated_token_address(ctx.accounts.depositor.key, &usdc),
+            &get_associated_token_address(&ctx.accounts.shielded.custody_owner, &usdc),
+            ctx.accounts.depositor.key,
+        )?;
+
+        let book = read_book(&ctx.accounts.book)?;
+        let (nav, supply) = nav_for_pricing(&ctx.accounts.vault, &book, &ctx.accounts.shielded)?;
+        let shares = if supply == 0 || nav == 0 {
+            amount
+        } else {
+            u64::try_from(amount as u128 * supply as u128 / nav as u128)
+                .map_err(|_| AgamaError::MathOverflow)?
+        };
+        require!(shares > 0, AgamaError::DustDeposit);
+        let price = share_price(nav, supply)?;
+
+        let position = &mut ctx.accounts.position;
+        blend_entry(position, shares, price)?;
+        position.private_shares = position.private_shares.saturating_add(shares);
+        mark(position, price, now)?;
+
+        let shielded = &mut ctx.accounts.shielded;
+        shielded.shares = shielded.shares.saturating_add(shares);
+        shielded.total_in = shielded.total_in.saturating_add(amount);
+        Ok(())
+    }
+
+    /// Burn private shares and open an exit ticket for the USDC. Runs inside the
+    /// enclave.
+    ///
+    /// The ticket names the position's owner as the only destination, so the
+    /// session key that signs this can trigger a redemption but cannot redirect
+    /// it. The custody pays the ticket through MagicBlock's private transfer
+    /// queue (`settle_exit`), after a random delay in `[min_delay_ms,
+    /// max_delay_ms]`, optionally in `split` parts. Solana sees the wallet receive
+    /// USDC from MagicBlock's queue vault, not from Agama.
+    ///
+    /// `group_id` is the queue's group id for the payout, chosen by the client
+    /// at random. It doubles as the ticket's id, and `settle_exit` holds the
+    /// payout to it, so one ticket can be paid once.
+    pub fn redeem_private(
+        ctx: Context<RedeemPrivate>,
+        shares: u64,
+        group_id: u32,
+        min_delay_ms: u64,
+        max_delay_ms: u64,
+        split: u32,
+    ) -> Result<()> {
+        require!(shares > 0, AgamaError::ZeroAmount);
+        require!(group_id > 0 && group_id <= 0x00FF_FFFF, AgamaError::BadExitParams);
+        require!(
+            split > 0 && min_delay_ms <= max_delay_ms && max_delay_ms <= MAX_EXIT_DELAY_MS,
+            AgamaError::BadExitParams
+        );
+        let now = Clock::get()?.unix_timestamp;
+        assert_may_act(&ctx.accounts.position, ctx.accounts.signer.key, now)?;
+        require!(
+            ctx.accounts.position.private_shares >= shares,
+            AgamaError::InsufficientShares
+        );
+
+        let book = read_book(&ctx.accounts.book)?;
+        let (nav, supply) = nav_for_pricing(&ctx.accounts.vault, &book, &ctx.accounts.shielded)?;
+        let assets = u64::try_from(shares as u128 * nav as u128 / supply as u128)
             .map_err(|_| AgamaError::MathOverflow)?;
-        position.cost_basis = u64::try_from(held as u128 * position.entry_price as u128 / ONE as u128)
-            .map_err(|_| AgamaError::MathOverflow)?;
-        position.yield_usdc = position.value_usdc.saturating_sub(position.cost_basis);
-        position.synced_ts = now;
-        position.syncs = position.syncs.saturating_add(1);
+        require!(assets > 0, AgamaError::DustDeposit);
+        // What the private custody holds, by its own books. Tickets already
+        // opened count as paid here, so two redemptions cannot both claim the
+        // same dollars.
+        let held = ctx.accounts.shielded.total_in.saturating_sub(ctx.accounts.shielded.total_out);
+        require!(assets <= held, AgamaError::InsufficientLiquidity);
+        let price = share_price(nav, supply)?;
+
+        let exits = &mut ctx.accounts.exits;
+        require!(
+            !exits.slots.iter().any(|e| e.group_id == group_id),
+            AgamaError::BadExitParams
+        );
+        let slot = exits
+            .slots
+            .iter_mut()
+            .find(|e| e.group_id == 0)
+            .ok_or(AgamaError::ExitBookFull)?;
+        *slot = Exit {
+            owner: ctx.accounts.position.owner,
+            assets,
+            min_delay_ms,
+            max_delay_ms,
+            group_id,
+            split,
+        };
+
+        let position = &mut ctx.accounts.position;
+        position.private_shares -= shares;
+        mark(position, price, now)?;
+
+        let shielded = &mut ctx.accounts.shielded;
+        shielded.shares = shielded.shares.saturating_sub(shares);
+        shielded.total_out = shielded.total_out.saturating_add(assets);
+        Ok(())
+    }
+
+    /// Close an exit ticket, once the custody has paid it in this same
+    /// transaction. The instruction before this one must be MagicBlock's
+    /// `DepositAndQueueTransfer` out of the custody, for exactly the ticket's
+    /// amount, to exactly its owner, with its group id, delays and split.
+    ///
+    /// The custody key is an operator key, so it could move funds without a
+    /// ticket. What this guarantees is the other direction: no ticket is ever
+    /// marked paid unless the payment is actually in the transaction.
+    pub fn settle_exit(ctx: Context<SettleExit>, group_id: u32) -> Result<()> {
+        let usdc = ctx.accounts.vault.usdc_mint;
+        let custody_owner = ctx.accounts.shielded.custody_owner;
+        let prev = previous_instruction(&ctx.accounts.instructions)?;
+        let exits = &mut ctx.accounts.exits;
+        let slot = exits
+            .slots
+            .iter_mut()
+            .find(|e| e.group_id == group_id && group_id != 0)
+            .ok_or(AgamaError::UnknownExit)?;
+
+        require_keys_eq!(prev.program_id, EPHEMERAL_SPL_TOKEN_PROGRAM_ID, AgamaError::PaymentMismatch);
+        let d = &prev.data;
+        require!(d.len() >= 32 && d[0] == ESPL_DEPOSIT_AND_QUEUE_TRANSFER, AgamaError::PaymentMismatch);
+        let u64_at = |i: usize| u64::from_le_bytes(d[i..i + 8].try_into().unwrap());
+        let gid = u32::from_le_bytes([d[9], d[10], d[11], 0]);
+        let split = u32::from_le_bytes(d[28..32].try_into().unwrap());
+        require!(
+            u64_at(1) == slot.assets
+                && gid == slot.group_id
+                && u64_at(12) == slot.min_delay_ms
+                && u64_at(20) == slot.max_delay_ms
+                && split == slot.split,
+            AgamaError::PaymentMismatch
+        );
+        require!(prev.accounts.len() >= 7, AgamaError::PaymentMismatch);
+        require!(
+            prev.accounts[2].pubkey == usdc
+                && prev.accounts[3].pubkey == get_associated_token_address(&custody_owner, &usdc)
+                && prev.accounts[5].pubkey == slot.owner
+                && prev.accounts[6].pubkey == custody_owner
+                && prev.accounts[6].is_signer,
+            AgamaError::PaymentMismatch
+        );
+        *slot = Exit::default();
+        Ok(())
+    }
+
+    /// Publish the private aggregate to Solana: one batched number for every
+    /// private deposit and redemption since the last commit.
+    pub fn commit_shielded(ctx: Context<CommitShielded>) -> Result<()> {
+        MagicIntentBundleBuilder::new(
+            ctx.accounts.payer.to_account_info(),
+            ctx.accounts.magic_context.to_account_info(),
+            ctx.accounts.magic_program.to_account_info(),
+        )
+        .commit(&[ctx.accounts.shielded.to_account_info()])
+        .build_and_invoke()?;
+        Ok(())
+    }
+
+    /// Commit the aggregate and hand it back to the base layer. Used to recycle
+    /// the delegation once its sponsored commits are spent.
+    pub fn undelegate_shielded(ctx: Context<CommitShielded>) -> Result<()> {
+        MagicIntentBundleBuilder::new(
+            ctx.accounts.payer.to_account_info(),
+            ctx.accounts.magic_context.to_account_info(),
+            ctx.accounts.magic_program.to_account_info(),
+        )
+        .commit_and_undelegate(&[ctx.accounts.shielded.to_account_info()])
+        .build_and_invoke()?;
         Ok(())
     }
 
@@ -643,30 +1002,109 @@ pub mod agama_magicblock {
 
 // ------------------------------------------------------------------- pricing
 
-/// NAV in USDC.
+/// NAV in USDC, and the share supply it is divided by.
 ///
 /// `book.nav` only counts capital the ER has actually marked into a pool. Between
-/// a base-layer deposit and the tick that absorbs it, those dollars sit in custody
-/// at par, so they are added here; dollars already paid out but not yet unmarked
-/// are subtracted. The result stays exact across the commit boundary instead of
+/// a deposit and the tick that absorbs it, those dollars sit in custody at par, so
+/// they are added here; dollars already paid out but not yet unmarked are
+/// subtracted. The result stays exact across the commit boundary instead of
 /// stepping every time the ER commits.
-fn nav_for_pricing(vault: &Account<Vault>, book: &PoolBook) -> Result<u64> {
-    // `absorb` runs on the rollup, where the vault is not readable, so the keeper
-    // is trusted to report how much new capital to deploy. Trusted, but not
-    // unchecked: the vault's cumulative flow is monotonic and lives here, so a book
-    // claiming to have absorbed more than Solana ever took in is arithmetically
+///
+/// Both custodies count: the public one on Solana (`vault`) and the private one in
+/// the enclave (`shielded`). The supply is agYLD plus private shares. On Solana
+/// `shielded` is its last committed state, which is safe to price on: private
+/// flow always enters and leaves at the share price, so a not-yet-committed
+/// private deposit moves NAV and supply in proportion and leaves the price alone.
+fn nav_for_pricing(vault: &Vault, book: &PoolBook, shielded: &Shielded) -> Result<(u64, u64)> {
+    // `absorb` runs on the rollup, where neither custody is readable, so the
+    // keeper is trusted to report how much new capital to deploy. Trusted, but
+    // not unchecked: cumulative flow is monotonic in both custodies, so a book
+    // claiming to have absorbed more than they ever took in is arithmetically
     // impossible and gets rejected rather than clamped.
     //
     // This does not stop a bad keeper from over-marking on the rollup. It stops the
     // over-mark from ever pricing a deposit or a redemption: both revert until the
     // book is corrected, instead of quietly minting against an inflated NAV.
+    let total_in = vault.total_in.saturating_add(shielded.total_in);
+    let total_out = vault.total_out.saturating_add(shielded.total_out);
     require!(
-        book.marked_in <= vault.total_in && book.marked_out <= vault.total_out,
+        book.marked_in <= total_in && book.marked_out <= total_out,
         AgamaError::BookAheadOfVault
     );
-    let unmarked = vault.total_in - book.marked_in;
-    let unreturned = vault.total_out - book.marked_out;
-    Ok(book.nav.saturating_add(unmarked).saturating_sub(unreturned))
+    let unmarked = total_in - book.marked_in;
+    let unreturned = total_out - book.marked_out;
+    let nav = book.nav.saturating_add(unmarked).saturating_sub(unreturned);
+    Ok((nav, vault.shares.saturating_add(shielded.shares)))
+}
+
+/// Fold `added` new shares bought at `price` into the position's average entry.
+fn blend_entry(position: &mut Position, added: u64, price: u64) -> Result<()> {
+    let before = position.shares.saturating_add(position.private_shares);
+    let after = before.saturating_add(added);
+    if after == 0 {
+        return Ok(());
+    }
+    let blended = (position.entry_price as u128 * before as u128 + price as u128 * added as u128)
+        / after as u128;
+    position.entry_price = u64::try_from(blended).map_err(|_| AgamaError::MathOverflow)?;
+    Ok(())
+}
+
+/// Re-mark value, cost basis and yield over public and private shares together.
+fn mark(position: &mut Position, price: u64, now: i64) -> Result<()> {
+    let total = position.shares.saturating_add(position.private_shares) as u128;
+    position.value_usdc =
+        u64::try_from(total * price as u128 / ONE as u128).map_err(|_| AgamaError::MathOverflow)?;
+    position.cost_basis = u64::try_from(total * position.entry_price as u128 / ONE as u128)
+        .map_err(|_| AgamaError::MathOverflow)?;
+    position.yield_usdc = position.value_usdc.saturating_sub(position.cost_basis);
+    position.synced_ts = now;
+    position.syncs = position.syncs.saturating_add(1);
+    Ok(())
+}
+
+/// The instruction immediately before the one executing, from the instructions
+/// sysvar. How this program sees a token movement it is not allowed to make.
+fn previous_instruction(sysvar: &UncheckedAccount) -> Result<Instruction> {
+    let current = load_current_index_checked(&sysvar.to_account_info())?;
+    require!(current > 0, AgamaError::TransferMismatch);
+    Ok(load_instruction_at_checked(current as usize - 1, &sysvar.to_account_info())?)
+}
+
+/// `ix` is an SPL Token transfer of exactly `amount` from `from` to `to`,
+/// authorised by `authority`. Accepts both `Transfer` and `TransferChecked`.
+fn assert_token_transfer(
+    ix: &Instruction,
+    amount: u64,
+    from: &Pubkey,
+    to: &Pubkey,
+    authority: &Pubkey,
+) -> Result<()> {
+    require_keys_eq!(ix.program_id, anchor_spl::token::ID, AgamaError::TransferMismatch);
+    let d = &ix.data;
+    let k = &ix.accounts;
+    let (src, dst, auth) = match d.first() {
+        Some(&SPL_TRANSFER) if d.len() >= 9 && k.len() >= 3 => (0, 1, 2),
+        Some(&SPL_TRANSFER_CHECKED) if d.len() >= 10 && k.len() >= 4 => (0, 2, 3),
+        _ => return err!(AgamaError::TransferMismatch),
+    };
+    require!(
+        u64::from_le_bytes(d[1..9].try_into().unwrap()) == amount
+            && k[src].pubkey == *from
+            && k[dst].pubkey == *to
+            && k[auth].pubkey == *authority
+            && k[auth].is_signer,
+        AgamaError::TransferMismatch
+    );
+    Ok(())
+}
+
+/// Share price, 6 decimals.
+fn share_price(nav: u64, supply: u64) -> Result<u64> {
+    if supply == 0 {
+        return Ok(ONE);
+    }
+    u64::try_from(nav as u128 * ONE as u128 / supply as u128).map_err(|_| error!(AgamaError::MathOverflow))
 }
 
 /// Who is allowed to act on a position inside the rollup.
@@ -718,6 +1156,20 @@ fn read_book(info: &UncheckedAccount) -> Result<PoolBook> {
     );
     let mut slice: &[u8] = &data[8..];
     PoolBook::deserialize(&mut slice).map_err(|_| error!(AgamaError::BadBookOwner))
+}
+
+/// Read the private aggregate on the base layer, where it is delegated to the TEE
+/// and so owned by the delegation program. Same checks as `read_book`.
+fn read_shielded(info: &UncheckedAccount) -> Result<Shielded> {
+    require!(
+        info.owner == &crate::ID || info.owner == &ephemeral_rollups_sdk::id(),
+        AgamaError::BadShielded
+    );
+    let data = info.try_borrow_data()?;
+    require!(data.len() > 8, AgamaError::BadShielded);
+    require!(data[..8] == Shielded::DISCRIMINATOR[..], AgamaError::BadShielded);
+    let mut slice: &[u8] = &data[8..];
+    Shielded::deserialize(&mut slice).map_err(|_| error!(AgamaError::BadShielded))
 }
 
 fn members_args(
@@ -861,6 +1313,9 @@ pub struct Position {
     pub vault: Pubkey,
     /// agYLD held, mirrored from the owner's token account at sync time.
     pub shares: u64,
+    /// Shares that exist only here: minted by `deposit_private`, burned by
+    /// `redeem_private`, never an SPL balance anywhere.
+    pub private_shares: u64,
     /// Share-weighted average entry price, 6 decimals.
     pub entry_price: u64,
     pub value_usdc: u64,
@@ -882,6 +1337,46 @@ pub struct Position {
 pub struct FaucetClaim {
     pub owner: Pubkey,
     pub last_ts: i64,
+}
+
+/// The private half of the vault, in aggregate. Lives in the TEE, gated to the
+/// vault authority; Solana sees it only as of the last `commit_shielded`.
+#[account]
+#[derive(InitSpace)]
+pub struct Shielded {
+    pub vault: Pubkey,
+    /// Owns the private custody eATA. An operator key rather than a PDA,
+    /// because the enclave refuses to pass a private eATA to this program, so
+    /// a PDA could never sign for it. See `settle_exit` for what is still held
+    /// to the program's rules.
+    pub custody_owner: Pubkey,
+    /// Private shares outstanding, across every position.
+    pub shares: u64,
+    /// Cumulative USDC into / out of the private custody. Monotonic, like the
+    /// vault's own, so `nav_for_pricing` can bound the book against both.
+    pub total_in: u64,
+    pub total_out: u64,
+    pub bump: u8,
+}
+
+/// A private redemption the custody still owes. `group_id == 0` is a free slot.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, InitSpace)]
+pub struct Exit {
+    pub owner: Pubkey,
+    pub assets: u64,
+    pub min_delay_ms: u64,
+    pub max_delay_ms: u64,
+    pub group_id: u32,
+    pub split: u32,
+}
+
+/// Open exit tickets. Lives in the TEE, gated to the authority, and is never
+/// committed: who redeemed what never reaches Solana from here.
+#[account]
+#[derive(InitSpace)]
+pub struct ExitBook {
+    pub vault: Pubkey,
+    pub slots: [Exit; EXIT_SLOTS],
 }
 
 // ------------------------------------------------------------------ contexts
@@ -983,6 +1478,9 @@ pub struct Deposit<'info> {
     /// PDA is pinned by seeds; ownership and discriminator are checked there.
     #[account(seeds = [BOOK_SEED, vault.key().as_ref()], bump)]
     pub book: UncheckedAccount<'info>,
+    /// CHECK: read-only, delegated to the TEE. See `read_shielded`.
+    #[account(seeds = [SHIELDED_V2_SEED, vault.key().as_ref()], bump)]
+    pub shielded: UncheckedAccount<'info>,
     #[account(mut, address = vault.usdc_mint @ AgamaError::BadMint)]
     pub usdc_mint: Account<'info, Mint>,
     #[account(mut, address = vault.agyld_mint @ AgamaError::BadMint)]
@@ -1020,6 +1518,9 @@ pub struct Redeem<'info> {
     /// CHECK: read-only and usually delegated. See `read_book`.
     #[account(seeds = [BOOK_SEED, vault.key().as_ref()], bump)]
     pub book: UncheckedAccount<'info>,
+    /// CHECK: read-only, delegated to the TEE. See `read_shielded`.
+    #[account(seeds = [SHIELDED_V2_SEED, vault.key().as_ref()], bump)]
+    pub shielded: UncheckedAccount<'info>,
     #[account(mut, address = vault.usdc_mint @ AgamaError::BadMint)]
     pub usdc_mint: Account<'info, Mint>,
     #[account(mut, address = vault.agyld_mint @ AgamaError::BadMint)]
@@ -1095,12 +1596,13 @@ pub struct PrepareForRollup<'info> {
     /// CHECK: topped up by address; the seeds pin which account it is.
     #[account(mut, seeds = [POSITION_SEED, owner.key().as_ref()], bump)]
     pub position: UncheckedAccount<'info>,
+    /// Absent for a fully private depositor, who holds no agYLD.
     #[account(
         mut,
         associated_token::mint = agyld_mint,
         associated_token::authority = owner,
     )]
-    pub owner_agyld: Account<'info, TokenAccount>,
+    pub owner_agyld: Option<Account<'info, TokenAccount>>,
     #[account(address = vault.agyld_mint @ AgamaError::BadMint)]
     pub agyld_mint: Account<'info, Mint>,
     #[account(seeds = [VAULT_SEED], bump = vault.bump)]
@@ -1215,11 +1717,179 @@ pub struct SyncPosition<'info> {
     /// CHECK: read-only, and delegated to a different rollup. See `read_book`.
     #[account(seeds = [BOOK_SEED, vault.key().as_ref()], bump)]
     pub book: UncheckedAccount<'info>,
+    #[account(seeds = [SHIELDED_V2_SEED, vault.key().as_ref()], bump = shielded.bump)]
+    pub shielded: Account<'info, Shielded>,
+    /// Absent for a fully private depositor, who holds no agYLD.
     #[account(
         associated_token::mint = vault.agyld_mint,
         associated_token::authority = owner,
     )]
-    pub owner_agyld: Account<'info, TokenAccount>,
+    pub owner_agyld: Option<Account<'info, TokenAccount>>,
+}
+
+#[derive(Accounts)]
+pub struct InitShielded<'info> {
+    #[account(mut, address = vault.authority @ AgamaError::Unauthorized)]
+    pub authority: Signer<'info>,
+    #[account(seeds = [VAULT_SEED], bump = vault.bump)]
+    pub vault: Account<'info, Vault>,
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + Shielded::INIT_SPACE,
+        seeds = [SHIELDED_V2_SEED, vault.key().as_ref()],
+        bump
+    )]
+    pub shielded: Account<'info, Shielded>,
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + ExitBook::INIT_SPACE,
+        seeds = [EXITS_SEED, vault.key().as_ref()],
+        bump
+    )]
+    pub exits: Box<Account<'info, ExitBook>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[delegate]
+#[derive(Accounts)]
+pub struct DelegateShielded<'info> {
+    #[account(mut, address = vault.authority @ AgamaError::Unauthorized)]
+    pub payer: Signer<'info>,
+    #[account(seeds = [VAULT_SEED], bump = vault.bump)]
+    pub vault: Account<'info, Vault>,
+    /// CHECK: the Shielded PDA, handed to the delegation program.
+    #[account(mut, del, seeds = [SHIELDED_V2_SEED, vault.key().as_ref()], bump)]
+    pub shielded: UncheckedAccount<'info>,
+    /// CHECK: target TEE validator, forwarded in DelegateConfig.
+    pub validator: Option<UncheckedAccount<'info>>,
+}
+
+#[delegate]
+#[derive(Accounts)]
+pub struct DelegateExits<'info> {
+    #[account(mut, address = vault.authority @ AgamaError::Unauthorized)]
+    pub payer: Signer<'info>,
+    #[account(seeds = [VAULT_SEED], bump = vault.bump)]
+    pub vault: Account<'info, Vault>,
+    /// CHECK: the ExitBook PDA, handed to the delegation program.
+    #[account(mut, del, seeds = [EXITS_SEED, vault.key().as_ref()], bump)]
+    pub exits: UncheckedAccount<'info>,
+    /// CHECK: target TEE validator, forwarded in DelegateConfig.
+    pub validator: Option<UncheckedAccount<'info>>,
+}
+
+#[derive(Accounts)]
+pub struct ShieldedPermission<'info> {
+    #[account(mut, address = vault.authority @ AgamaError::Unauthorized)]
+    pub authority: Signer<'info>,
+    #[account(seeds = [VAULT_SEED], bump = vault.bump)]
+    pub vault: Account<'info, Vault>,
+    #[account(mut, seeds = [SHIELDED_V2_SEED, vault.key().as_ref()], bump = shielded.bump)]
+    pub shielded: Account<'info, Shielded>,
+    /// CHECK: derived and validated under the permission program.
+    #[account(
+        mut,
+        seeds = [PERMISSION_SEED, shielded.key().as_ref()],
+        bump,
+        seeds::program = permission_program.key()
+    )]
+    pub permission: UncheckedAccount<'info>,
+    /// CHECK: only its address and lamports are used; seeds pin it.
+    #[account(mut, seeds = [EXITS_SEED, vault.key().as_ref()], bump)]
+    pub exits: UncheckedAccount<'info>,
+    /// CHECK: derived and validated under the permission program.
+    #[account(
+        mut,
+        seeds = [PERMISSION_SEED, exits.key().as_ref()],
+        bump,
+        seeds::program = permission_program.key()
+    )]
+    pub exits_permission: UncheckedAccount<'info>,
+    /// CHECK: address-checked.
+    #[account(address = PERMISSION_PROGRAM_ID)]
+    pub permission_program: UncheckedAccount<'info>,
+    /// CHECK: address-checked.
+    #[account(mut, address = EPHEMERAL_VAULT_ID)]
+    pub ephemeral_vault: UncheckedAccount<'info>,
+    /// CHECK: address-checked.
+    #[account(address = MAGIC_PROGRAM_ID)]
+    pub magic_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct DepositPrivate<'info> {
+    /// The throwaway key that shielded the USDC, and that signs the transfer
+    /// into the custody in the instruction before this one.
+    pub depositor: Signer<'info>,
+    /// The owner's wallet, or the session key it authorised.
+    pub signer: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [POSITION_SEED, position.owner.as_ref()],
+        bump = position.bump
+    )]
+    pub position: Account<'info, Position>,
+    #[account(seeds = [VAULT_SEED], bump = vault.bump)]
+    pub vault: Account<'info, Vault>,
+    /// CHECK: read-only, delegated to the public rollup. See `read_book`.
+    #[account(seeds = [BOOK_SEED, vault.key().as_ref()], bump)]
+    pub book: UncheckedAccount<'info>,
+    #[account(mut, seeds = [SHIELDED_V2_SEED, vault.key().as_ref()], bump = shielded.bump)]
+    pub shielded: Account<'info, Shielded>,
+    /// CHECK: address-checked; read through `load_instruction_at_checked`.
+    #[account(address = solana_instructions_sysvar::ID)]
+    pub instructions: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct RedeemPrivate<'info> {
+    /// The owner's wallet, or the session key it authorised.
+    pub signer: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [POSITION_SEED, position.owner.as_ref()],
+        bump = position.bump
+    )]
+    pub position: Account<'info, Position>,
+    #[account(seeds = [VAULT_SEED], bump = vault.bump)]
+    pub vault: Account<'info, Vault>,
+    /// CHECK: read-only, delegated to the public rollup. See `read_book`.
+    #[account(seeds = [BOOK_SEED, vault.key().as_ref()], bump)]
+    pub book: UncheckedAccount<'info>,
+    #[account(mut, seeds = [SHIELDED_V2_SEED, vault.key().as_ref()], bump = shielded.bump)]
+    pub shielded: Account<'info, Shielded>,
+    #[account(mut, seeds = [EXITS_SEED, vault.key().as_ref()], bump)]
+    pub exits: Box<Account<'info, ExitBook>>,
+}
+
+#[derive(Accounts)]
+pub struct SettleExit<'info> {
+    #[account(address = vault.authority @ AgamaError::Unauthorized)]
+    pub authority: Signer<'info>,
+    #[account(seeds = [VAULT_SEED], bump = vault.bump)]
+    pub vault: Account<'info, Vault>,
+    #[account(seeds = [SHIELDED_V2_SEED, vault.key().as_ref()], bump = shielded.bump)]
+    pub shielded: Account<'info, Shielded>,
+    #[account(mut, seeds = [EXITS_SEED, vault.key().as_ref()], bump)]
+    pub exits: Box<Account<'info, ExitBook>>,
+    /// CHECK: address-checked; read through `load_instruction_at_checked`.
+    #[account(address = solana_instructions_sysvar::ID)]
+    pub instructions: UncheckedAccount<'info>,
+}
+
+#[commit]
+#[derive(Accounts)]
+pub struct CommitShielded<'info> {
+    /// Only the authority decides when the aggregate goes public. Anyone else
+    /// committing after every deposit would turn the batch back into a trail.
+    #[account(mut, address = vault.authority @ AgamaError::Unauthorized)]
+    pub payer: Signer<'info>,
+    #[account(seeds = [VAULT_SEED], bump = vault.bump)]
+    pub vault: Account<'info, Vault>,
+    #[account(mut, seeds = [SHIELDED_V2_SEED, vault.key().as_ref()], bump = shielded.bump)]
+    pub shielded: Account<'info, Shielded>,
 }
 
 // ------------------------------------------------------------------- events
@@ -1275,4 +1945,16 @@ pub enum AgamaError {
     BadBookOwner,
     #[msg("the pool book has absorbed more flow than the vault ever took in")]
     BookAheadOfVault,
+    #[msg("shielded account is not the expected PDA, owner or type")]
+    BadShielded,
+    #[msg("group id, split or delay out of range, or group id already in use")]
+    BadExitParams,
+    #[msg("the previous instruction is not the expected transfer into the custody")]
+    TransferMismatch,
+    #[msg("the previous instruction is not the payment this exit ticket asks for")]
+    PaymentMismatch,
+    #[msg("no open exit ticket with this group id")]
+    UnknownExit,
+    #[msg("every exit slot is taken; wait for the custody to pay one")]
+    ExitBookFull,
 }

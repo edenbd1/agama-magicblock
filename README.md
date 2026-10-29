@@ -8,6 +8,12 @@ Same product as the Starknet, Sui and Stellar deployments. Deposit USDC, mint
 agYLD, watch its price rise as four private-credit lending pools accrue. What
 changes here is where each part of it executes.
 
+And one thing the other deployments cannot do: a **fully private deposit**. The
+USDC goes in through MagicBlock's private payments, comes back as shares that
+exist only inside the TEE, and leaves through MagicBlock's private transfer
+queue. Solana never sees an Agama instruction for it. See
+[Fully private deposits](#fully-private-deposits).
+
 ## The rule
 
 > Do not delegate the token. Delegate the machinery.
@@ -21,7 +27,7 @@ split is:
 |---|---|---|
 | **Solana devnet** | agYLD SPL mint, USDC custody, `deposit`, `redeem` | Must stay tradable, LP-able, usable as collateral |
 | **Ephemeral Rollup** (public, EU) | The `PoolBook`: four pools, their principals, APRs, the marked NAV | Accrual per tick instead of per block, and ticking is free |
-| **Private ER (TEE)** | Per-depositor `Position` ledgers, gated by an `EphemeralPermission` | Position detail should not be public |
+| **Private ER (TEE)** | Per-depositor `Position` ledgers, gated by an `EphemeralPermission`; the private custody, its aggregate (`Shielded`) and its exit tickets (`ExitBook`) | Position detail should not be public, and a private deposit should not be either |
 
 Note that the book runs on an *open* rollup, not the TEE one. Pool marks, APRs and
 NAV are things Agama publishes; putting them behind an enclave would hide the
@@ -72,6 +78,17 @@ programs/agama-magicblock/src/lib.rs
 | `close_permission` | Drops the gate and refunds its rent |
 | `sync_position` | Recomputes marked value, cost basis and yield inside the enclave |
 | `undelegate_position` | Returns the ledger to Solana |
+| `init_shielded_permission` | Gates `Shielded` and `ExitBook` to the vault authority |
+| `deposit_private` | Credits private shares for a shielded transfer it reads in the same transaction |
+| `redeem_private` | Burns private shares, opens an exit ticket to the owner's wallet |
+| `settle_exit` | Closes a ticket, only next to the custody's actual payment of it |
+| `commit_shielded` | Publishes the private aggregate to Solana, as one batched number |
+| `undelegate_shielded` | Commits and returns the aggregate, to recycle its delegation |
+
+Base layer, for the private side: `init_shielded` (aggregate + exit book, records
+the custody key), `delegate_shielded`, `delegate_exits`. `deposit`, `redeem` and
+`sync_position` now read `Shielded` too, because the share price counts both
+custodies and both kinds of share.
 
 ## Two things worth reading the code for
 
@@ -106,6 +123,84 @@ storing deposit amounts anywhere public defeats the point. Instead `sync_positio
 reads the owner's agYLD balance and the ticked NAV, both on-chain, and carries a
 share-weighted average entry price. Accrued yield is derived from that, entirely
 inside the enclave, with nothing attested by the user.
+
+## Fully private deposits
+
+The ledger above hides the *shape* of a position, but on its own it hides little:
+the deposit that created it is a public SPL transfer into Agama, `Deposited`
+logs `user, assets, shares, nav` in clear, and the agYLD balance is public. Entry
+price, value and yield are all recomputable from that. A private deposit closes
+all three.
+
+```
+ Solana                          TEE (MagicBlock private rollup)               Solana
+ ──────                          ───────────────────────────────               ──────
+ wallet ──USDC──> throwaway key
+   └─ shield into MagicBlock ──> key's private eATA
+      (Ephemeral SPL Token)        │  SPL transfer ──> Agama private custody
+                                   │  deposit_private: reads that transfer,
+                                   │    mints private shares in the Position
+                                   │
+                                   │  redeem_private: burns shares,
+                                   │    opens an exit ticket (owner, amount)
+                                   │  keeper: custody pays the ticket through
+                                   │    MagicBlock's private queue, settle_exit  ──> USDC to the
+                                   │    checks the payment in the same tx            wallet, from
+                                   │                                                 MagicBlock
+                                   └─ commit_shielded, every 10 min ───────────────> one aggregate
+```
+
+**What Solana sees, and does not**
+
+| | Public deposit | Private deposit |
+|---|---|---|
+| An Agama instruction carrying the amount | yes | **no**: the shield touches only SPL Token, Associated Token and MagicBlock's Ephemeral SPL Token |
+| `Deposited` / `Redeemed` event | yes | **none** |
+| agYLD minted to the wallet | yes | **never** |
+| Shares, entry price, value, yield | derivable | inside the TEE, owner (and admitted viewers) only |
+| The redemption payout | from Agama's vault | from MagicBlock's queue, after the keeper's 20 s grace and a random delay |
+| Agama's private side | n/a | one aggregate (`shares`, `total_in`, `total_out`) per batched commit |
+| That the wallet has a private position | n/a | **yes**: `init_position` / `delegate_position` are Agama instructions |
+| How much the wallet shielded, and when | n/a | **yes**: it is a transfer into MagicBlock, visible as such |
+
+So the gain is unlinkability, not invisibility. Anyone can see a wallet move N
+USDC into MagicBlock, a service many apps share; nobody outside the enclave can
+see that it went to Agama, what it bought or what it is worth. With few private
+depositors per commit window, an observer can still match amounts between a
+shield and the next aggregate, which is why the aggregate only moves in batches,
+why the position setup and the shield are separate transactions, and why it is
+worth stating.
+
+**One wallet approval per deposit** (two the first time: opening the ledger, then
+the shield, kept apart so "this wallet opened an Agama position" and "this
+amount" are never in the same transaction). Everything inside the enclave is
+signed by browser-held keys: the session key and the shield key.
+
+**Trust model.** `deposit_private` is trustless: it credits nothing unless the
+instruction right before it is an SPL transfer of exactly that amount, from the
+depositor, into the custody, read through the instructions sysvar. `redeem_private`
+names the position's owner as the only destination, so a stolen session key can
+trigger a redemption but not redirect it. `settle_exit` never closes a ticket
+unless the matching payment (amount, destination, group id, delays, split, out of
+the custody) is in the same transaction. What is *not* program-enforced: the
+private custody is owned by an operator key (`.keys/private-custody.json`), not a
+PDA, so that key could move custody funds outside a ticket. That is forced by #7
+below, it is the same trust a custodian holds in a real credit vault, and on
+mainnet it belongs in an MPC or multisig. The live aggregate and the exit book are
+gated to the vault authority, which therefore sees who redeems what.
+
+**Run it**
+
+```bash
+npx tsx scripts/setup-private.ts   # once: Shielded, ExitBook, permissions, custody eATA, exit queue
+npx tsx scripts/e2e-private.ts     # the whole loop from a new wallet, plus the refusals
+```
+
+The e2e checks eight refusals along the way: a credit with no transfer, a credit
+larger than the transfer, a transfer to the wrong account, one transfer credited
+twice, a stranger committing the aggregate, a stranger's session redeeming, a
+ticket closed with no payment, and a ticket closed after paying one unit short or
+paying someone else.
 
 ## Running it
 
@@ -151,6 +246,10 @@ contract on an EVM chain is a PDA of a single program here. Everything below is 
 | agYLD mint | `5v2dRhbcEBWH5YUapkeQV9d3C84Ek4P8hH7tfWPxWCPA` | PDA `[agyld-mint]`, 6 decimals |
 | Test USDC mint | `DuiuxGrD1iQJnuZKw1muqDgYRaV2QGvcqymM8ay4gy4Q` | PDA `[usdc-mint]`, 6 decimals |
 | USDC custody | `ehxmrwjm5WoCMoh3KEe8WwXY35mj5oFbGRcJYF1qiyN` | The vault's ATA, where the collateral sits |
+| Shielded | `3FPYkJoCZBrb4vdC2hbjA7gMyXJTsJJFWXhv3y5gbEzu` | PDA `[shielded-v2, vault]`. The private aggregate. Delegated to the TEE, gated |
+| Exit book | `3RCWrvpjTsAjEbNzupAJmchWJ3Ma4Czn9DJqHCemqFhJ` | PDA `[exits, vault]`. Open private redemptions. Delegated to the TEE, gated, never committed |
+| Private custody | owner `4YMK9bLrj6mjZDwgcVsL1wSEyDbNBD2bBEweTwiVvBGQ`, eATA `Hf68zAmtRDRK3hcqqfYFEfpBh3WGzqQ92hALSNWwCDs6` | Operator key's private eATA on the TEE |
+| Exit queue | `9zGHeRsgu1UHw9iWYDwfutKbFGp3FLPzmTEcHbiS9fXw` | MagicBlock transfer queue for (test USDC, TEE validator) |
 
 On an explorer the pool book reads as owned by `DELeGGvX…`. That is what a delegated
 account looks like, not a mistake.
@@ -188,7 +287,7 @@ login token, unless you are the owner.
 | TEE, Intel TDX | `MTEWGuqxUpYZGFJQcp8tLN7x5v9BSeoFHYWQQ3n3xzo` | every private position |
 
 `scripts/e2e.ts` walks the whole thing from a keypair that has never existed, which
-is the only test that catches all six problems below in the order a user hits them.
+is the only test that catches the problems below in the order a user hits them.
 Its last step is the claim, stated as a measurement rather than an adjective:
 
 ```
@@ -198,7 +297,7 @@ Its last step is the claim, stated as a measurement rather than an adjective:
        anonymous (no login)      nothing
 ```
 
-## Six things that cost an afternoon each
+## Eight things that cost an afternoon each
 
 Every one of these is a MagicBlock-specific failure with an error message that
 points somewhere other than the cause. Together they are the real integration
@@ -301,6 +400,26 @@ localStorage, expires in seven days, and losing it costs a click.
 Note that it also has to be a member of the `EphemeralPermission`, because it reads
 with its own login token, and a token minted for a non-member sees nothing.
 
+**7. The TEE refuses any transaction that hands a private eATA to your program.**
+A private eATA (an Ephemeral SPL Token balance with a permission) can appear in a
+TEE transaction only inside an SPL Token or MagicBlock instruction at the top
+level. Pass it to your own program, readable or writable, signer or not, under
+any login token, and the query filter answers `403 {"error":"Access denied"}`
+before anything executes. Accounts gated by an ER-local `EphemeralPermission`
+(the `Position`, `Shielded`) behave differently: the gate stops *reads*, and
+non-members can still write them through the program. Found by elimination
+(`sync` + the eATA added as a spare account fails; an SPL transfer of the same
+eATA in the same transaction passes).
+
+That is why `deposit_private` reads the transfer next to it instead of making it,
+and why the custody cannot be a PDA: a PDA can only sign through a CPI, and the
+CPI would need the eATA passed to the program. Worth asking MagicBlock whether a
+program can be allowlisted on an eATA's permission.
+
+**8. A 1 kB Borsh account overflows the BPF stack.** `ExitBook` (16 tickets)
+loaded as a plain `Account` dies with `Access violation in stack frame 5`. `Box`
+it, or take it as `UncheckedAccount` where only its address matters.
+
 **6. Permission rent has no headroom on the grow path.** `EphemeralPermission::size_of(n)`
 is `35 + (1 + n) * 33`, and `rent(bytes)` is `(bytes + 60) * 32` lamports. A
 permission created with one member and later grown to a four-member cap needs
@@ -324,11 +443,15 @@ re-delegating rather than by paying for an unbounded commit stream.
 | `deploy.sh` | deploy, initialise, fund the accounts the rollup clones, delegate |
 | `setup.ts` | vault, mints, the four pools, delegation |
 | `topup.ts` | fund the keeper's ephemeral escrow |
-| `keeper.ts` | tick, absorb, commit |
+| `keeper.ts` | tick, absorb (both custodies), commit; and the private side via `private-keeper.ts`: batched `commit_shielded`, paying exit tickets |
+| `recycle.ts` | undelegate and re-delegate the book once its 10 sponsored commits are spent; the keeper calls it itself |
 | `state.ts` | read both layers and print the drift |
 | `smoke.ts` | faucet, deposit, read the book back off the rollup |
 | `privacy.ts` | the position ledger walk, with the three-reader check |
 | `e2e.ts` | the same from a brand-new keypair |
+| `setup-private.ts` | the private side: `Shielded`, `ExitBook`, their gates, the custody eATA, the exit queue |
+| `e2e-private.ts` | a fully private deposit and redemption from a brand-new wallet, with the refusals |
+| `private.ts` | instruction builders for the private path, shared by the scripts |
 | `probe-qfs.ts` | which methods a private endpoint gates, and what it says |
 
 Set `MB_ENV=local` on any of them to point the whole suite at `mb-stack`
@@ -341,11 +464,20 @@ exercised identically; what it cannot give you is the hardware attestation.
 - **Cranks.** `tick` is written to be a crank target and the keeper is a stand-in
   for one. Moving it to `MagicBlockInstruction::ScheduleTask` removes the last
   piece of infrastructure Agama operates itself.
-- **Private USDC leg.** The position ledger is private; the deposit that created it
-  is a public SPL transfer, and the agYLD balance is a public SPL balance. What is
-  hidden today is the *shape* of the position: entry price, marked value, accrued
-  yield, and who else is allowed to see them. Routing the USDC leg through Ephemeral
-  SPL Token private payments is what would close the rest of the gap.
+- **What the private path still leaks.** Participation (the ledger is opened by an
+  Agama instruction) and the shielded amount and time (a transfer into MagicBlock).
+  The encrypted-destination variant of MagicBlock's shield
+  (`depositAndDelegateShuttleEphemeralAtaWithMergeAndPrivateTransfer`, random delay
+  and split) would blur the amount and time; opening ledgers from a relayer would
+  hide participation.
+- **Custody key.** The private custody is an operator key (see #7). MPC or multisig
+  on mainnet, or a program-owned custody if MagicBlock lets a program onto an
+  eATA's permission.
+- **A new device.** The owner can read their ledger from any device (the wallet
+  signs the enclave login), but acting on it needs the session key, which lives in
+  the browser that opened the ledger and cannot be replaced once the ledger is
+  delegated. An in-enclave `authorize_session` checked against an Ed25519 signature
+  from the wallet would fix it.
 - **Attestation.** Nothing here verifies the enclave's quote. `verifyTeeRpcIntegrity`
   exists in the SDK and should run before a client trusts a TEE endpoint in
   production; skipping it means trusting DNS.

@@ -21,6 +21,7 @@ import {
   TEE_VALIDATOR,
   agyldMint,
   bookPda,
+  shieldedPda,
   authedConnectionTo,
   sendAndPoll,
   delegationStatus,
@@ -155,6 +156,7 @@ async function main() {
         position,
         vault: vaultPda,
         book: bookPda,
+        shielded: shieldedPda,
         ownerAgyld: ata(agyldMint, me),
       })
       .transaction(),

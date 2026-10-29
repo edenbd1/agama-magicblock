@@ -47,8 +47,10 @@ export const PROGRAM_ID = new PublicKey("GVHsSaFUkVAZJdRKWtK1SxYUhW2P7a7z1xBL5Sa
 
 export const VAULT_SEED = Buffer.from("agama-vault");
 export const BOOK_SEED = Buffer.from(BOOK_SEED_NAME);
-// Bumped with the layout when positions gained a session key.
-export const POSITION_SEED = Buffer.from("position-v2");
+// Bumped with the layout: v2 added the session key, v3 private shares.
+export const POSITION_SEED = Buffer.from("position-v3");
+export const SHIELDED_SEED = Buffer.from("shielded-v2");
+export const EXITS_SEED = Buffer.from("exits");
 export const USDC_SEED = Buffer.from("usdc-mint");
 export const AGYLD_SEED = Buffer.from("agyld-mint");
 
@@ -59,6 +61,21 @@ export const [bookPda] = PublicKey.findProgramAddressSync(
 );
 export const [usdcMint] = PublicKey.findProgramAddressSync([USDC_SEED], PROGRAM_ID);
 export const [agyldMint] = PublicKey.findProgramAddressSync([AGYLD_SEED], PROGRAM_ID);
+export const [shieldedPda] = PublicKey.findProgramAddressSync(
+  [SHIELDED_SEED, vaultPda.toBuffer()],
+  PROGRAM_ID,
+);
+export const [exitsPda] = PublicKey.findProgramAddressSync([EXITS_SEED, vaultPda.toBuffer()], PROGRAM_ID);
+
+/// The operator key that owns Agama's private USDC custody (an eATA delegated to
+/// the TEE). A key and not a PDA because the enclave will not hand a private
+/// eATA to the Agama program, so a PDA could never sign for it.
+export function loadCustodyKeypair(): Keypair {
+  const p = process.env.CUSTODY_KEYPAIR ?? path.join(__dirname, "..", ".keys", "private-custody.json");
+  return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(p, "utf8"))));
+}
+/// The private rollup. Positions, the private aggregate and the custody live here.
+export const TEE_RPC = process.env.TEE_ENDPOINT ?? "https://devnet-tee.magicblock.app";
 
 export function positionPda(owner: PublicKey): PublicKey {
   return PublicKey.findProgramAddressSync([POSITION_SEED, owner.toBuffer()], PROGRAM_ID)[0];

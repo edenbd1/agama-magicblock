@@ -4,7 +4,9 @@
 // commit, the rollup holds the live one, and the difference is yield that has
 // accrued since. Everything else here is what the app's Earn page shows.
 import { Connection } from "@solana/web3.js";
+import { BN } from "@coral-xyz/anchor";
 import { BASE_RPC, bookPda, erEndpointFor, loadKeypair, programFor, vaultPda } from "./common";
+import { committedShielded } from "./private-keeper";
 
 const usdc = (v: any) => (Number(v.toString()) / 1e6).toFixed(6);
 const price = (nav: any, shares: any) =>
@@ -21,24 +23,33 @@ async function main() {
   const vault: any = await base.account.vault.fetch(vaultPda);
   const settled: any = await base.account.poolBook.fetch(bookPda);
   const live: any = await er.account.poolBook.fetch(bookPda);
+  // The private custody, as Solana last saw it. Its live state is in the TEE,
+  // gated to the authority; the batched commit is all the public ever gets.
+  const sh: any = (await committedShielded(base)) ?? { shares: new BN(0), totalIn: new BN(0), totalOut: new BN(0) };
+  const totalIn = vault.totalIn.add(sh.totalIn);
+  const totalOut = vault.totalOut.add(sh.totalOut);
+  const supply = vault.shares.add(sh.shares);
 
   // NAV as the program computes it: the book's marked value plus dollars sitting
   // in custody that this copy of the book has not absorbed yet. Comparing raw
   // `book.nav` across layers would count unabsorbed principal as drift.
   const navOf = (book: any) =>
-    book.nav.add(vault.totalIn.sub(book.markedIn)).sub(vault.totalOut.sub(book.markedOut));
+    book.nav.add(totalIn.sub(book.markedIn)).sub(totalOut.sub(book.markedOut));
   const settledNav = navOf(settled);
   const liveNav = navOf(live);
 
   console.log(
-    `vault    shares=${usdc(vault.shares)}  in=${usdc(vault.totalIn)}  out=${usdc(vault.totalOut)}`,
+    `public   shares=${usdc(vault.shares)}  in=${usdc(vault.totalIn)}  out=${usdc(vault.totalOut)}   (agYLD)`,
   );
   console.log(
-    `solana   nav=${usdc(settledNav)}  price=${price(settledNav, vault.shares)}  ` +
+    `private  shares=${usdc(sh.shares)}  in=${usdc(sh.totalIn)}  out=${usdc(sh.totalOut)}   (last batched commit)`,
+  );
+  console.log(
+    `solana   nav=${usdc(settledNav)}  price=${price(settledNav, supply)}  ` +
       `ticks=${settled.ticks}  (committed marks ${usdc(settled.nav)})`,
   );
   console.log(
-    `rollup   nav=${usdc(liveNav)}  price=${price(liveNav, vault.shares)}  ` +
+    `rollup   nav=${usdc(liveNav)}  price=${price(liveNav, supply)}  ` +
       `ticks=${live.ticks}   ${erUrl}`,
   );
   console.log(`drift    ${usdc(liveNav.sub(settledNav))} USDC accrued since the last commit\n`);

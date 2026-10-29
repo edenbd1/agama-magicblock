@@ -23,6 +23,7 @@ custom-panic = []
 [dependencies]
 anchor-lang = { version = "1.0.2", features = ["init-if-needed"] }
 anchor-spl = "1.0.2"
+solana-instructions-sysvar = "3.0.1"
 ephemeral-rollups-sdk = { version = "0.16.2", features = ["anchor", "access-control"] }
 
 [dev-dependencies]

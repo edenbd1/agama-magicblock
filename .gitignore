@@ -10,3 +10,4 @@ test-ledger
 # Local mb-stack state. Ledger data and a validator keypair, none of it reproducible
 # or worth publishing.
 magicblock-test-storage
+.keys/
