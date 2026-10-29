@@ -86,6 +86,8 @@ pub const EPHEMERAL_SPL_TOKEN_PROGRAM_ID: Pubkey =
     pubkey!("SPLxh1LVZzEkX99H6rqYizhytLWPZVV296zyYDPagv2");
 /// `DepositAndQueueTransfer` in that program.
 const ESPL_DEPOSIT_AND_QUEUE_TRANSFER: u8 = 16;
+/// Solana's Ed25519 signature-verification precompile.
+pub const ED25519_PROGRAM_ID: Pubkey = pubkey!("Ed25519SigVerify111111111111111111111111111");
 /// SPL Token `Transfer` and `TransferChecked`.
 const SPL_TRANSFER: u8 = 3;
 const SPL_TRANSFER_CHECKED: u8 = 12;
@@ -730,6 +732,71 @@ pub mod agama_magicblock {
         mark(position, price, now)
     }
 
+    /// Trust a new session key, from inside the enclave, on the wallet's word.
+    ///
+    /// `authorize_session` runs on Solana, and a delegated position cannot be
+    /// written there. So once a ledger is in the enclave, a lost or expired
+    /// session key would be unrecoverable: no way to redeem private shares from a
+    /// new device, or from this one after seven days. The wallet cannot sign a
+    /// rollup transaction either, but it can sign a message. So the instruction
+    /// before this one must be the Ed25519 precompile verifying the owner's
+    /// signature over exactly `session_message(position, session_key, expiry)`.
+    ///
+    /// `expiry` only moves forward, which makes an old signed message worthless:
+    /// replaying it would set an earlier expiry than the current one. The
+    /// permission is rewritten with the new key in place of the old one, and every
+    /// admitted viewer kept.
+    pub fn rotate_session(ctx: Context<RotateSession>, session_key: Pubkey, expiry: i64) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let position_key = ctx.accounts.position.key();
+        let owner = ctx.accounts.position.owner;
+        let old_session = ctx.accounts.position.session_key;
+        require!(session_key != Pubkey::default(), AgamaError::BadSessionRotation);
+        require!(
+            expiry > now
+                && expiry <= now + SESSION_TTL + 3600
+                && expiry > ctx.accounts.position.session_expiry,
+            AgamaError::BadSessionRotation
+        );
+
+        let prev = previous_instruction(&ctx.accounts.instructions)?;
+        let message = session_message(&position_key, &session_key, expiry);
+        assert_ed25519(&prev, &owner, message.as_bytes())?;
+
+        let position = &mut ctx.accounts.position;
+        position.session_key = session_key;
+        position.session_expiry = expiry;
+
+        if position.is_private {
+            let viewers: Vec<Pubkey> = {
+                let data = ctx.accounts.permission.try_borrow_data()?;
+                let permission = EphemeralPermission::from_bytes(&data)
+                    .map_err(|_| error!(AgamaError::BadSessionRotation))?;
+                permission
+                    .members
+                    .iter()
+                    .map(|m| m.pubkey)
+                    .filter(|k| *k != owner && *k != old_session)
+                    .collect()
+            };
+            let bump = [position.bump];
+            let signer_seeds: &[&[u8]] = &[POSITION_SEED, owner.as_ref(), &bump];
+            UpdateEphemeralPermissionCpi {
+                payer: ctx.accounts.position.to_account_info(),
+                permissioned_account: ctx.accounts.position.to_account_info(),
+                permission: ctx.accounts.permission.to_account_info(),
+                vault: ctx.accounts.ephemeral_vault.to_account_info(),
+                magic_program: ctx.accounts.magic_program.to_account_info(),
+                permission_program: ctx.accounts.permission_program.to_account_info(),
+                authority: ctx.accounts.position.to_account_info(),
+                authority_is_signer: false,
+                args: members_args(true, &owner, session_key, &viewers),
+            }
+            .invoke_signed(&[signer_seeds])?;
+        }
+        Ok(())
+    }
+
     // ------------------------------------------------- private deposits (TEE)
 
     /// Gate the private aggregate and the exit book so only the vault authority
@@ -1069,6 +1136,41 @@ fn previous_instruction(sysvar: &UncheckedAccount) -> Result<Instruction> {
     let current = load_current_index_checked(&sysvar.to_account_info())?;
     require!(current > 0, AgamaError::TransferMismatch);
     Ok(load_instruction_at_checked(current as usize - 1, &sysvar.to_account_info())?)
+}
+
+/// What the owner's wallet signs to hand a position to a new session key. Plain
+/// text, so the wallet shows the user exactly what they are approving.
+pub fn session_message(position: &Pubkey, session_key: &Pubkey, expiry: i64) -> String {
+    format!(
+        "Agama on MagicBlock\nAuthorize session key {} for position {} until {}",
+        session_key, position, expiry
+    )
+}
+
+/// `ix` is the Ed25519 precompile verifying one signature by `signer` over
+/// exactly `message`, with every offset pointing into the instruction itself.
+/// The precompile has already failed the transaction if the signature is wrong;
+/// this checks it was the right signer and the right message.
+fn assert_ed25519(ix: &Instruction, signer: &Pubkey, message: &[u8]) -> Result<()> {
+    require_keys_eq!(ix.program_id, ED25519_PROGRAM_ID, AgamaError::BadSessionRotation);
+    let d = &ix.data;
+    require!(d.len() >= 16 && d[0] == 1, AgamaError::BadSessionRotation);
+    let u16_at = |i: usize| u16::from_le_bytes([d[i], d[i + 1]]) as usize;
+    // signature_offset, signature_ix, pubkey_offset, pubkey_ix, msg_offset, msg_len, msg_ix
+    let (pk_off, msg_off, msg_len) = (u16_at(6), u16_at(10), u16_at(12));
+    require!(
+        u16_at(4) == 0xFFFF && u16_at(8) == 0xFFFF && u16_at(14) == 0xFFFF,
+        AgamaError::BadSessionRotation
+    );
+    require!(
+        d.len() >= pk_off + 32 && d.len() >= msg_off + msg_len,
+        AgamaError::BadSessionRotation
+    );
+    require!(
+        d[pk_off..pk_off + 32] == signer.to_bytes()[..] && &d[msg_off..msg_off + msg_len] == message,
+        AgamaError::BadSessionRotation
+    );
+    Ok(())
 }
 
 /// `ix` is an SPL Token transfer of exactly `amount` from `from` to `to`,
@@ -1728,6 +1830,39 @@ pub struct SyncPosition<'info> {
 }
 
 #[derive(Accounts)]
+pub struct RotateSession<'info> {
+    /// Whoever submits it, usually the new session key. Its authority comes from
+    /// the owner's signature, checked in the handler.
+    pub submitter: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [POSITION_SEED, position.owner.as_ref()],
+        bump = position.bump
+    )]
+    pub position: Account<'info, Position>,
+    /// CHECK: derived and validated under the permission program.
+    #[account(
+        mut,
+        seeds = [PERMISSION_SEED, position.key().as_ref()],
+        bump,
+        seeds::program = permission_program.key()
+    )]
+    pub permission: UncheckedAccount<'info>,
+    /// CHECK: address-checked.
+    #[account(address = PERMISSION_PROGRAM_ID)]
+    pub permission_program: UncheckedAccount<'info>,
+    /// CHECK: address-checked.
+    #[account(mut, address = EPHEMERAL_VAULT_ID)]
+    pub ephemeral_vault: UncheckedAccount<'info>,
+    /// CHECK: address-checked.
+    #[account(address = MAGIC_PROGRAM_ID)]
+    pub magic_program: UncheckedAccount<'info>,
+    /// CHECK: address-checked; read through `load_instruction_at_checked`.
+    #[account(address = solana_instructions_sysvar::ID)]
+    pub instructions: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
 pub struct InitShielded<'info> {
     #[account(mut, address = vault.authority @ AgamaError::Unauthorized)]
     pub authority: Signer<'info>,
@@ -1957,4 +2092,6 @@ pub enum AgamaError {
     UnknownExit,
     #[msg("every exit slot is taken; wait for the custody to pay one")]
     ExitBookFull,
+    #[msg("session rotation needs the owner's Ed25519 signature over the exact message, and a later expiry")]
+    BadSessionRotation,
 }

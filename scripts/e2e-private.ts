@@ -11,6 +11,8 @@
 //   [7] redeem half privately: the custody pays the ticket through MagicBlock's
 //       queue, and the USDC lands in the wallet
 //   [8] the program refuses what it should refuse
+//   [9] the session key is lost: the wallet signs a message, a new key takes
+//       over inside the enclave, and redeems the rest
 //
 //   npx tsx scripts/e2e-private.ts
 import { BN } from "@coral-xyz/anchor";
@@ -41,7 +43,8 @@ import {
   usdcMint,
   vaultPda,
 } from "./common";
-import { ata, depositPrivateIxs, payExitIxs, randomGroupId, redeemPrivateIx, shieldIxs } from "./private";
+import nacl from "tweetnacl";
+import { ata, depositPrivateIxs, payExitIxs, randomGroupId, redeemPrivateIx, rotateSessionIxs, sessionMessage, shieldIxs } from "./private";
 
 const DELEGATION_PROGRAM_ID = new PublicKey("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
 const DEPOSIT = 300_000_000n;
@@ -284,6 +287,40 @@ async function main() {
   console.log(`       ticket ${left.slots.some((e: any) => e.groupId === groupId) ? "STILL OPEN" : "closed"}`);
   const pos2: any = await er.account.position.fetch(position);
   console.log(`       private shares ${usdc(pos2.privateShares)}  value ${usdc(pos2.valueUsdc)}`);
+
+  step("[9]", "the session key is lost: the wallet signs one message, a new key takes over");
+  const session2 = Keypair.generate();
+  const teeS2 = await authedConnectionTo(teeUrl, session2);
+  const er2 = programFor(teeS2, session2);
+  const current: any = await er.account.position.fetch(position);
+  const expiry = Math.floor(Date.now() / 1000) + 7 * 24 * 3600;
+  const sign = (k: Keypair, m: Buffer) => nacl.sign.detached(m, k.secretKey);
+  const msg = sessionMessage(position, session2.publicKey, expiry);
+  const forged = await rotateSessionIxs(er2, { owner: wallet.publicKey, position, submitter: session2.publicKey, sessionKey: session2.publicKey, expiry, signature: sign(stranger, msg), signedBy: stranger.publicKey });
+  await refuses("a stranger's signature hands it over", teeS2, forged, [session2], "BadSessionRotation");
+  const stale = Number(current.sessionExpiry.toString());
+  const replay = await rotateSessionIxs(er2, { owner: wallet.publicKey, position, submitter: session2.publicKey, sessionKey: session2.publicKey, expiry: stale, signature: sign(wallet, sessionMessage(position, session2.publicKey, stale)) });
+  await refuses("an expiry that does not move forward", teeS2, replay, [session2], "BadSessionRotation");
+  const rotate = await rotateSessionIxs(er2, { owner: wallet.publicKey, position, submitter: session2.publicKey, sessionKey: session2.publicKey, expiry, signature: sign(wallet, msg) });
+  console.log("       rotated", await sendAndPoll(teeS2, new Transaction().add(...rotate), [session2]));
+  await refuses("the same signed message, replayed", teeS2, rotate, [session2], "BadSessionRotation");
+  const asNew: any = await er2.account.position.fetch(position).catch(() => null);
+  console.log(`       new key reads the ledger      ${asNew && !asNew.owner.equals(PublicKey.default) ? `yes, ${usdc(asNew.privateShares)} private shares` : "NO"}`);
+  const oldReads = await teeS.getAccountInfo(position).catch(() => null);
+  console.log(`       old key reads the ledger      ${oldReads && !new PublicKey(oldReads.data.subarray(8, 40)).equals(PublicKey.default) ? "STILL YES" : "no"}`);
+  await refuses("the old key redeems", teeS,
+    [await redeemPrivateIx(er, { signer: session.publicKey, position, shares: new BN(1), groupId: randomGroupId() })], [session], "Unauthorized");
+  const rest = new BN(asNew.privateShares.toString());
+  const before9 = BigInt((await base.getTokenAccountBalance(ata(wallet.publicKey))).value.amount);
+  console.log("       new key redeems the rest", await sendAndPoll(teeS2, new Transaction().add(
+    await redeemPrivateIx(er2, { signer: session2.publicKey, position, shares: rest, groupId: randomGroupId(), maxDelayMs: 3000 }),
+  ), [session2]));
+  for (let i = 0; i < 60; i++) {
+    const now = BigInt((await base.getTokenAccountBalance(ata(wallet.publicKey))).value.amount);
+    if (now > before9) { console.log(`       wallet received ${usdc(now - before9)} USDC`); break; }
+    if (i === 59) { console.log("       nothing arrived"); process.exitCode = 1; }
+    await sleep(3000);
+  }
   console.log(`\nwallet USDC  ${usdc(startUsdc)} -> ${usdc(BigInt((await base.getTokenAccountBalance(ata(wallet.publicKey))).value.amount))}, agYLD never minted`);
 }
 

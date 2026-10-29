@@ -78,6 +78,7 @@ programs/agama-magicblock/src/lib.rs
 | `close_permission` | Drops the gate and refunds its rent |
 | `sync_position` | Recomputes marked value, cost basis and yield inside the enclave |
 | `undelegate_position` | Returns the ledger to Solana |
+| `rotate_session` | Trusts a new session key, on an Ed25519 signature from the owner's wallet read next to it |
 | `init_shielded_permission` | Gates `Shielded` and `ExitBook` to the vault authority |
 | `deposit_private` | Credits private shares for a shielded transfer it reads in the same transaction |
 | `redeem_private` | Burns private shares, opens an exit ticket to the owner's wallet |
@@ -189,6 +190,20 @@ below, it is the same trust a custodian holds in a real credit vault, and on
 mainnet it belongs in an MPC or multisig. The live aggregate and the exit book are
 gated to the vault authority, which therefore sees who redeems what.
 
+**A lost or expired session key.** `authorize_session` runs on Solana, and a
+delegated ledger cannot be written there, so without a way round it a cleared
+browser, a new device or simply day eight would lock a depositor out of their
+private shares. `rotate_session` is that way round, inside the enclave: the
+wallet signs a plain-text message (wallets sign messages, just not rollup
+transactions), the Ed25519 precompile verifies it in the instruction before, and
+the program checks it was the owner over exactly
+`Authorize session key <key> for position <pda> until <expiry>`. The expiry only
+moves forward, so an old signed message is worthless. The permission is rewritten
+with the new key in place of the old one and every admitted viewer kept. In the
+app it is one message prompt, no transaction, triggered by any private action
+or by *Use this browser for this ledger*. The Ed25519 precompile works on the
+devnet TEE: a valid signature lands, a forged one fails with `Custom: 2`.
+
 **Run it**
 
 ```bash
@@ -200,7 +215,10 @@ The e2e checks eight refusals along the way: a credit with no transfer, a credit
 larger than the transfer, a transfer to the wrong account, one transfer credited
 twice, a stranger committing the aggregate, a stranger's session redeeming, a
 ticket closed with no payment, and a ticket closed after paying one unit short or
-paying someone else.
+paying someone else. Then it loses the session key and recovers: a rotation
+signed by a stranger, one with an expiry that does not move forward and the same
+signed message replayed are all refused; the new key reads the ledger, the old
+one no longer can and cannot redeem, and the new key redeems the rest.
 
 ## Running it
 
@@ -473,11 +491,7 @@ exercised identically; what it cannot give you is the hardware attestation.
 - **Custody key.** The private custody is an operator key (see #7). MPC or multisig
   on mainnet, or a program-owned custody if MagicBlock lets a program onto an
   eATA's permission.
-- **A new device.** The owner can read their ledger from any device (the wallet
-  signs the enclave login), but acting on it needs the session key, which lives in
-  the browser that opened the ledger and cannot be replaced once the ledger is
-  delegated. An in-enclave `authorize_session` checked against an Ed25519 signature
-  from the wallet would fix it.
+
 - **Attestation.** Nothing here verifies the enclave's quote. `verifyTeeRpcIntegrity`
   exists in the SDK and should run before a client trusts a TEE endpoint in
   production; skipping it means trusting DNS.

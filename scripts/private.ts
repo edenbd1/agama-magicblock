@@ -17,7 +17,7 @@
 // movement is its own top-level instruction and the Agama program only reads it.
 import * as anchor from "@coral-xyz/anchor";
 import { BN } from "@coral-xyz/anchor";
-import { Keypair, PublicKey, SYSVAR_INSTRUCTIONS_PUBKEY, TransactionInstruction } from "@solana/web3.js";
+import { Ed25519Program, Keypair, PublicKey, SYSVAR_INSTRUCTIONS_PUBKEY, TransactionInstruction } from "@solana/web3.js";
 import {
   TOKEN_PROGRAM_ID,
   createAssociatedTokenAccountIdempotentInstruction,
@@ -30,6 +30,7 @@ import {
   EPHEMERAL_SPL_TOKEN_PROGRAM_ID,
   EPHEMERAL_VAULT_ID,
   MAGIC_PROGRAM_ID,
+  PERMISSION_PROGRAM_ID,
   deriveEphemeralAta,
   deriveGroupReceipt,
   deriveQueueVaultAta,
@@ -180,4 +181,37 @@ export function queueTransferIx(a: {
 
 export function newShieldKey(): Keypair {
   return Keypair.generate();
+}
+
+/// What the owner's wallet signs to hand a delegated position to a new session
+/// key. Must match `session_message` in the program byte for byte.
+export function sessionMessage(position: PublicKey, sessionKey: PublicKey, expiry: number): Buffer {
+  return Buffer.from(`Agama on MagicBlock\nAuthorize session key ${sessionKey.toBase58()} for position ${position.toBase58()} until ${expiry}`);
+}
+
+/// TEE. The Ed25519 precompile verifying the wallet's signature, then
+/// `rotate_session`, which reads that verification. Signer: anyone (the new key).
+export async function rotateSessionIxs(
+  program: anchor.Program,
+  args: { owner: PublicKey; position: PublicKey; submitter: PublicKey; sessionKey: PublicKey; expiry: number; signature: Uint8Array; signedBy?: PublicKey; message?: Buffer },
+): Promise<TransactionInstruction[]> {
+  const message = args.message ?? sessionMessage(args.position, args.sessionKey, args.expiry);
+  const verify = Ed25519Program.createInstructionWithPublicKey({
+    publicKey: (args.signedBy ?? args.owner).toBytes(),
+    message,
+    signature: args.signature,
+  });
+  const rotate = await program.methods
+    .rotateSession(args.sessionKey, new BN(args.expiry))
+    .accounts({
+      submitter: args.submitter,
+      position: args.position,
+      permission: PublicKey.findProgramAddressSync([Buffer.from("permission:"), args.position.toBuffer()], PERMISSION_PROGRAM_ID)[0],
+      permissionProgram: PERMISSION_PROGRAM_ID,
+      ephemeralVault: EPHEMERAL_VAULT_ID,
+      magicProgram: MAGIC_PROGRAM_ID,
+      instructions: SYSVAR_INSTRUCTIONS_PUBKEY,
+    })
+    .instruction();
+  return [verify, rotate];
 }
