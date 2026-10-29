@@ -136,9 +136,11 @@ all three.
 ```
  Solana                          TEE (MagicBlock private rollup)               Solana
  ──────                          ───────────────────────────────               ──────
- wallet ──USDC──> throwaway key
-   └─ shield into MagicBlock ──> key's private eATA
-      (Ephemeral SPL Token)        │  SPL transfer ──> Agama private custody
+ wallet ── MagicBlock private transfer, destination sealed to the TEE ──┐
+                                   queue: random delay, split in parts  │
+ throwaway key <── delivered ───────────────────────────────────────────┘
+   └─ shield (fees paid by the sponsor) ──> key's private eATA
+                                   │  SPL transfer ──> Agama private custody
                                    │  deposit_private: reads that transfer,
                                    │    mints private shares in the Position
                                    │
@@ -155,14 +157,15 @@ all three.
 
 | | Public deposit | Private deposit |
 |---|---|---|
-| An Agama instruction carrying the amount | yes | **no**: the shield touches only SPL Token, Associated Token and MagicBlock's Ephemeral SPL Token |
+| An Agama instruction carrying the amount | yes | **no**: every public transaction on the way in is MagicBlock's Ephemeral SPL Token only |
+| A public transaction naming both the wallet and the throwaway key | n/a | **no**: the wallet's send has the key sealed to the TEE validator; the key's shield is paid by a sponsor, so it never needs SOL from the wallet |
 | `Deposited` / `Redeemed` event | yes | **none** |
 | agYLD minted to the wallet | yes | **never** |
 | Shares, entry price, value, yield | derivable | inside the TEE, owner (and admitted viewers) only |
 | The redemption payout | from Agama's vault | from MagicBlock's queue, after the keeper's 20 s grace and a random delay |
 | Agama's private side | n/a | one aggregate (`shares`, `total_in`, `total_out`) per batched commit |
 | That the wallet has a private position | n/a | **yes**: `init_position` / `delegate_position` are Agama instructions |
-| How much the wallet shielded, and when | n/a | **yes**: it is a transfer into MagicBlock, visible as such |
+| How much the wallet sent, and when | n/a | **yes**: a private send into MagicBlock, visible as such. The delivery to the key happens later (random 5 to 45 s by default) and in two parts |
 
 So the gain is unlinkability, not invisibility. Anyone can see a wallet move N
 USDC into MagicBlock, a service many apps share; nobody outside the enclave can
@@ -173,8 +176,19 @@ why the position setup and the shield are separate transactions, and why it is
 worth stating.
 
 **One wallet approval per deposit** (two the first time: opening the ledger, then
-the shield, kept apart so "this wallet opened an Agama position" and "this
-amount" are never in the same transaction). Everything inside the enclave is
+the private send, kept apart so "this wallet opened an Agama position" and "this
+amount" are never in the same transaction). MagicBlock charges 0.1% on the
+private send, on top of the amount.
+
+**The sponsor.** The throwaway key receives USDC from MagicBlock's queue and has
+to shield it into its eATA, which costs fees and rent (about 0.008 SOL). Sending
+it SOL from the wallet would put the two in one public transfer, the link the
+sealed destination exists to avoid. So `/api/magicblock/sponsor` in the app signs
+as fee payer, and only for exactly the four instructions `sponsoredShieldIxs`
+builds for that key and amount: it rebuilds them and refuses any other
+instruction, account, data, payer or signer set. The keeper keeps it funded.
+`scripts/check-app-espl.ts` checks the app's hand-built MagicBlock instructions
+against the SDK's. Everything inside the enclave is
 signed by browser-held keys: the session key and the shield key.
 
 **Trust model.** `deposit_private` is trustless: it credits nothing unless the
@@ -483,11 +497,9 @@ exercised identically; what it cannot give you is the hardware attestation.
   for one. Moving it to `MagicBlockInstruction::ScheduleTask` removes the last
   piece of infrastructure Agama operates itself.
 - **What the private path still leaks.** Participation (the ledger is opened by an
-  Agama instruction) and the shielded amount and time (a transfer into MagicBlock).
-  The encrypted-destination variant of MagicBlock's shield
-  (`depositAndDelegateShuttleEphemeralAtaWithMergeAndPrivateTransfer`, random delay
-  and split) would blur the amount and time; opening ledgers from a relayer would
-  hide participation.
+  Agama instruction) and the amount and time of the wallet's private send into
+  MagicBlock. Opening ledgers through a relayer would hide participation; varying
+  the split and splitting one deposit across several sends would blur amounts.
 - **Custody key.** The private custody is an operator key (see #7). MPC or multisig
   on mainnet, or a program-owned custody if MagicBlock lets a program onto an
   eATA's permission.
