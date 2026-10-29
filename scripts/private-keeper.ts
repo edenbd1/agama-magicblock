@@ -8,7 +8,11 @@
 //              open ticket from the custody through MagicBlock's private queue,
 //              closing it in the same transaction (`settle_exit` checks the
 //              payment is really there).
-import { Connection, PublicKey, Transaction } from "@solana/web3.js";
+//   sponsor    every SPONSOR_EVERY ticks, top the shield sponsor back up from the
+//              authority when it runs low. Each shield costs it ~0.008 SOL of
+//              fees and rent; an empty sponsor makes private deposits stall
+//              between delivery and shield (they resume once it is refilled).
+import { Connection, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { PERMISSION_PROGRAM_ID, EPHEMERAL_VAULT_ID, MAGIC_PROGRAM_ID } from "@magicblock-labs/ephemeral-rollups-sdk";
 import {
   BASE_RPC,
@@ -19,6 +23,7 @@ import {
   exitsPda,
   loadCustodyKeypair,
   loadKeypair,
+  loadSponsorKeypair,
   programFor,
   sendAndPoll,
   shieldedPda,
@@ -34,6 +39,9 @@ export const EXITS_EVERY = Number(process.env.EXITS_EVERY ?? 5);
 // own random delay, it puts distance between the moment a redemption is asked
 // for inside the enclave and the moment money moves on Solana.
 export const EXIT_GRACE_S = Number(process.env.EXIT_GRACE_S ?? 20);
+export const SPONSOR_EVERY = Number(process.env.SPONSOR_EVERY ?? 300);
+const SPONSOR_FLOOR = 150_000_000; // 0.15 SOL
+const SPONSOR_REFILL = 300_000_000;
 const LIMIT = '"Custom":2684354560';
 const usdc = (v: any) => (Number(v.toString()) / 1e6).toFixed(6);
 
@@ -54,6 +62,21 @@ export class PrivateKeeper {
   async step(n: number) {
     if (n % EXITS_EVERY === 0) await this.payExits();
     if (n % SHIELDED_COMMIT_EVERY === 0) await this.commit(n);
+    if (n % SPONSOR_EVERY === 0) await this.refillSponsor();
+  }
+
+  private async refillSponsor() {
+    let sponsor: PublicKey;
+    try {
+      sponsor = loadSponsorKeypair().publicKey;
+    } catch {
+      return; // no sponsor on this machine
+    }
+    const base = new Connection(BASE_RPC, "confirmed");
+    const have = await base.getBalance(sponsor);
+    if (have >= SPONSOR_FLOOR) return;
+    const tx = new Transaction().add(SystemProgram.transfer({ fromPubkey: this.wallet.publicKey, toPubkey: sponsor, lamports: SPONSOR_REFILL }));
+    console.log(`sponsor at ${(have / 1e9).toFixed(3)} SOL, refilled  ${await sendAndPoll(base, tx, [this.wallet])}`);
   }
 
   private seen = new Map<number, number>();
