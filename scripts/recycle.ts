@@ -72,11 +72,29 @@ export async function recycleBook(log = console.log): Promise<void> {
     const st = await delegationStatus(bookPda);
     if (st?.isDelegated) {
       log("delegated to", st.fqdn);
-      return;
+      break;
     }
+    if (i === 29) throw new Error("router does not see the book as delegated after 60s");
     await sleep(2000);
   }
-  throw new Error("router does not see the book as delegated after 60s");
+
+  // The router saying "delegated" is not the rollup accepting writes. On 29 Oct
+  // the EU rollup kept answering "required to be delegated to the current
+  // validator" for a book the delegation program said was delegated to it, and
+  // every tick after that failed quietly. So prove it with one tick.
+  const url = await erEndpointFor(bookPda);
+  const conn = await authedConnectionTo(url, wallet);
+  const er2 = programFor(conn, wallet);
+  for (let i = 0; ; i++) {
+    try {
+      const tick = await er2.methods.tick().accounts({ payer: wallet.publicKey, book: bookPda }).transaction();
+      log("first tick", await sendAndPoll(conn, tick, [wallet]));
+      return;
+    } catch (e: any) {
+      if (i >= 10) throw new Error(`the rollup will not write the re-delegated book (${String(e?.message).slice(0, 120)}); see migrate-book.ts`);
+      await sleep(3000);
+    }
+  }
 }
 
 if (require.main === module) {

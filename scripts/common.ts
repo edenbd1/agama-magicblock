@@ -41,7 +41,8 @@ export const LOCALNET_VALIDATOR = new PublicKey("mAGicPQYBMvcYveUZA5F5UNNwyHvfYh
 /// script suite onto the local stack.
 export const IS_LOCAL = process.env.MB_ENV === "local";
 
-export const BOOK_SEED_NAME = "lending-book";
+// v2 since 29 Oct 2026: the EU rollup lost track of v1's delegation. See migrate-book.ts.
+export const BOOK_SEED_NAME = "lending-book-v2";
 
 export const PROGRAM_ID = new PublicKey("GVHsSaFUkVAZJdRKWtK1SxYUhW2P7a7z1xBL5SaFj5vC");
 
@@ -57,6 +58,11 @@ export const AGYLD_SEED = Buffer.from("agyld-mint");
 export const [vaultPda] = PublicKey.findProgramAddressSync([VAULT_SEED], PROGRAM_ID);
 export const [bookPda] = PublicKey.findProgramAddressSync(
   [BOOK_SEED, vaultPda.toBuffer()],
+  PROGRAM_ID,
+);
+/// The pre-migration book. Still delegated, no longer writable by the rollup.
+export const [legacyBookPda] = PublicKey.findProgramAddressSync(
+  [Buffer.from("lending-book"), vaultPda.toBuffer()],
   PROGRAM_ID,
 );
 export const [usdcMint] = PublicKey.findProgramAddressSync([USDC_SEED], PROGRAM_ID);

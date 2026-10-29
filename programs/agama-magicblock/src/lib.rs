@@ -68,7 +68,11 @@ use ephemeral_rollups_sdk::consts::{EPHEMERAL_VAULT_ID, MAGIC_PROGRAM_ID, PERMIS
 declare_id!("GVHsSaFUkVAZJdRKWtK1SxYUhW2P7a7z1xBL5SaFj5vC");
 
 pub const VAULT_SEED: &[u8] = b"agama-vault";
-pub const BOOK_SEED: &[u8] = b"lending-book";
+/// v2 since 29 October 2026, when the EU validator stopped treating the v1 book
+/// as delegated to it while the delegation program still said it was. Nothing
+/// on the client side can undo that, so the book moved. See `migrate_book`.
+pub const BOOK_SEED: &[u8] = b"lending-book-v2";
+pub const LEGACY_BOOK_SEED: &[u8] = b"lending-book";
 /// v3: positions now carry private shares. v2 ledgers are left where they are.
 pub const POSITION_SEED: &[u8] = b"position-v3";
 /// v2: the custody is owned by an operator key, recorded here. See `Shielded`.
@@ -353,6 +357,30 @@ pub mod agama_magicblock {
         position.syncs = 0;
         position.synced_ts = 0;
         position.is_private = false;
+        Ok(())
+    }
+
+    /// Open the current book as an exact copy of the legacy one, as Solana last
+    /// saw it: pools, principals, accrued yield, marks, clock and tick count.
+    ///
+    /// For when a rollup loses track of a delegation it still holds on paper.
+    /// The legacy book stays delegated and unwritable, but its last committed
+    /// state is readable on Solana, and that is a complete book: accrual is a
+    /// function of elapsed time since `last_ts`, so the first tick on the copy
+    /// catches up exactly the yield the frozen book missed. `marked_in` and
+    /// `marked_out` carry over, so pricing never sees a jump.
+    pub fn migrate_book(ctx: Context<MigrateBook>) -> Result<()> {
+        let old = read_book(&ctx.accounts.legacy_book)?;
+        let book = &mut ctx.accounts.book;
+        book.vault = ctx.accounts.vault.key();
+        book.authority = ctx.accounts.authority.key();
+        book.pools = old.pools;
+        book.nav = old.nav;
+        book.marked_in = old.marked_in;
+        book.marked_out = old.marked_out;
+        book.last_ts = old.last_ts;
+        book.ticks = old.ticks;
+        book.bump = ctx.bumps.book;
         Ok(())
     }
 
@@ -1531,6 +1559,26 @@ pub struct InitBook<'info> {
     pub authority: Signer<'info>,
     #[account(seeds = [VAULT_SEED], bump = vault.bump)]
     pub vault: Account<'info, Vault>,
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + PoolBook::INIT_SPACE,
+        seeds = [BOOK_SEED, vault.key().as_ref()],
+        bump
+    )]
+    pub book: Account<'info, PoolBook>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateBook<'info> {
+    #[account(mut, address = vault.authority @ AgamaError::Unauthorized)]
+    pub authority: Signer<'info>,
+    #[account(seeds = [VAULT_SEED], bump = vault.bump)]
+    pub vault: Account<'info, Vault>,
+    /// CHECK: read-only, delegated and possibly orphaned. See `read_book`.
+    #[account(seeds = [LEGACY_BOOK_SEED, vault.key().as_ref()], bump)]
+    pub legacy_book: UncheckedAccount<'info>,
     #[account(
         init,
         payer = authority,

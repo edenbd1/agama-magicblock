@@ -58,7 +58,9 @@ async function main() {
   await priv.connect();
 
   let n = 0;
-  let privAt = -1;
+  let privAt = 0;
+  let lastTicks = -1;
+  let stalled = 0;
   for (;;) {
     try {
       // Deploy anything Solana has taken in that the book has not marked yet.
@@ -86,14 +88,26 @@ async function main() {
         }
       }
 
-      await er.methods
-        .tick()
-        .accounts({ payer: wallet.publicKey, book: bookPda })
-        .rpc({ skipPreflight: true });
+      // Fire and forget. `.rpc()` waits for a websocket confirmation the rollup's
+      // proxy does not relay, so it threw `Unknown action 'undefined'` on ticks
+      // that had landed, and the loop stalled on them. A tick is idempotent and
+      // the next one catches up, so there is nothing to wait for.
+      const tickTx = await er.methods.tick().accounts({ payer: wallet.publicKey, book: bookPda }).transaction();
+      tickTx.feePayer = wallet.publicKey;
+      tickTx.recentBlockhash = (await erConn.getLatestBlockhash("confirmed")).blockhash;
+      tickTx.sign(wallet);
+      await erConn.sendRawTransaction(tickTx.serialize(), { skipPreflight: true });
       n++;
 
       if (n % 25 === 0) {
         const book: any = await er.account.poolBook.fetch(bookPda);
+        // Ticks are sent without waiting, so a rollup that stops accepting them
+        // would otherwise go unnoticed. Two reads in a row with no progress is a
+        // stall worth shouting about (see migrate-book.ts for the one we hit).
+        const t = Number(book.ticks.toString());
+        stalled = t === lastTicks ? stalled + 1 : 0;
+        lastTicks = t;
+        if (stalled >= 2) console.error(`STALL: the book has not ticked for ${stalled * 25} sends; the rollup may have lost its delegation`);
         console.log(
           `tick ${n}  nav=${usdc(book.nav)} USDC  ticks=${book.ticks}  marked_in=${usdc(book.markedIn)}`,
         );
@@ -120,11 +134,9 @@ async function main() {
       console.error("tick failed:", (e?.message ?? String(e)).split("\n")[0]);
       await sleep(2000);
     }
+    // On its own clock, so a run of failed ticks never holds up paying an exit.
     try {
-      if (n !== privAt) {
-        privAt = n;
-        await priv.step(n);
-      }
+      await priv.step(++privAt);
     } catch (e: any) {
       console.error("private step failed:", (e?.message ?? String(e)).split("\n")[0]);
     }
