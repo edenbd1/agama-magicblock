@@ -467,6 +467,21 @@ attached. Without one, the validator accepts ten plain commits and then hard-fai
 so `keeper.ts` commits on a slow cadence and the session is closed by
 re-delegating rather than by paying for an unbounded commit stream.
 
+## Tests
+
+```bash
+cargo test -p agama-magicblock --lib   # the checks the private path rests on
+npx tsx scripts/e2e.ts                 # public path, from a new keypair
+npx tsx scripts/e2e-private.ts         # private path, with every refusal
+npx tsx scripts/check-app-espl.ts      # the app's MagicBlock instructions vs the SDK
+```
+
+The unit tests cover what a forged or mismatched neighbour instruction looks like
+to `deposit_private` and `rotate_session` (wrong amount, destination, source,
+authority, unsigned, wrong program, an approve instead of a transfer; another
+signer, another message, offsets into another instruction), pricing across both
+custodies, the book bound, and the entry-price average.
+
 ## Scripts
 
 | | |

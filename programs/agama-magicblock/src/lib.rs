@@ -2095,3 +2095,194 @@ pub enum AgamaError {
     #[msg("session rotation needs the owner's Ed25519 signature over the exact message, and a later expiry")]
     BadSessionRotation,
 }
+
+// -------------------------------------------------------------------- tests
+//
+// The checks the private path's safety rests on, run natively with
+// `cargo test`: the two introspection checks (what a forged or mismatched
+// neighbour instruction looks like to them), pricing across both custodies, and
+// the entry-price average.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anchor_lang::solana_program::instruction::AccountMeta;
+
+    fn key(n: u8) -> Pubkey {
+        Pubkey::new_from_array([n; 32])
+    }
+
+    fn vault(shares: u64, total_in: u64, total_out: u64) -> Vault {
+        Vault { authority: key(1), usdc_mint: key(2), agyld_mint: key(3), shares, total_in, total_out, bump: 0 }
+    }
+
+    fn book(nav: u64, marked_in: u64, marked_out: u64) -> PoolBook {
+        PoolBook {
+            vault: key(4),
+            authority: key(1),
+            pools: [PoolEntry::default(); POOL_COUNT],
+            nav,
+            marked_in,
+            marked_out,
+            last_ts: 0,
+            ticks: 0,
+            bump: 0,
+        }
+    }
+
+    fn shielded(shares: u64, total_in: u64, total_out: u64) -> Shielded {
+        Shielded { vault: key(4), custody_owner: key(9), shares, total_in, total_out, bump: 0 }
+    }
+
+    fn transfer_ix(tag: u8, amount: u64, from: Pubkey, to: Pubkey, auth: Pubkey, signs: bool) -> Instruction {
+        let mut data = vec![tag];
+        data.extend_from_slice(&amount.to_le_bytes());
+        let mut accounts = vec![AccountMeta::new(from, false)];
+        if tag == SPL_TRANSFER_CHECKED {
+            data.push(DECIMALS);
+            accounts.push(AccountMeta::new_readonly(key(2), false));
+        }
+        accounts.push(AccountMeta::new(to, false));
+        accounts.push(AccountMeta::new_readonly(auth, signs));
+        Instruction { program_id: anchor_spl::token::ID, accounts, data }
+    }
+
+    // ------------------------------------------------------------ pricing
+
+    #[test]
+    fn unmarked_flow_from_both_custodies_prices_at_par() {
+        // 1000 marked into the pools; 100 public and 50 private not absorbed yet.
+        let (nav, supply) = nav_for_pricing(&vault(900, 1_100, 0), &book(1_000, 1_000, 0), &shielded(40, 50, 0)).unwrap();
+        assert_eq!(nav, 1_150);
+        assert_eq!(supply, 940);
+    }
+
+    #[test]
+    fn a_book_ahead_of_both_custodies_is_rejected() {
+        let r = nav_for_pricing(&vault(0, 100, 0), &book(0, 151, 0), &shielded(0, 50, 0));
+        assert!(r.is_err());
+        // Exactly at the combined total is fine.
+        assert!(nav_for_pricing(&vault(0, 100, 0), &book(0, 150, 0), &shielded(0, 50, 0)).is_ok());
+    }
+
+    #[test]
+    fn a_private_deposit_not_yet_committed_leaves_the_price_alone() {
+        // Base prices on the committed aggregate; the enclave on the live one.
+        // A private deposit enters at the share price, so both agree.
+        let v = vault(1_000, 1_000, 0);
+        let b = book(1_100, 1_000, 0);
+        let committed = shielded(0, 0, 0);
+        let (nav0, s0) = nav_for_pricing(&v, &b, &committed).unwrap();
+        let price = share_price(nav0, s0).unwrap();
+        // 110 units of USDC at a price of 1.1 buy 100 units of shares.
+        let shares = (110u128 * ONE as u128 / price as u128) as u64;
+        assert_eq!(shares, 100);
+        let live = shielded(shares, 110, 0);
+        let (nav1, s1) = nav_for_pricing(&v, &b, &live).unwrap();
+        let p1 = share_price(nav1, s1).unwrap();
+        assert!(p1.abs_diff(price) <= 1, "{price} vs {p1}");
+    }
+
+    #[test]
+    fn entry_price_averages_in_and_marks_both_kinds_of_share() {
+        let mut p = Position {
+            owner: key(1),
+            vault: key(4),
+            shares: 0,
+            private_shares: 0,
+            entry_price: ONE,
+            value_usdc: 0,
+            cost_basis: 0,
+            yield_usdc: 0,
+            synced_ts: 0,
+            syncs: 0,
+            is_private: true,
+            bump: 0,
+            session_key: key(5),
+            session_expiry: 0,
+        };
+        blend_entry(&mut p, 100 * ONE, ONE).unwrap();
+        p.private_shares = 100 * ONE;
+        blend_entry(&mut p, 100 * ONE, 2 * ONE).unwrap();
+        p.shares = 100 * ONE; // the second lot arrived as agYLD
+        assert_eq!(p.entry_price, 3 * ONE / 2);
+        mark(&mut p, 2 * ONE, 7).unwrap();
+        assert_eq!(p.value_usdc, 400 * ONE);
+        assert_eq!(p.cost_basis, 300 * ONE);
+        assert_eq!(p.yield_usdc, 100 * ONE);
+    }
+
+    // ------------------------------------------- the transfer deposit_private reads
+
+    #[test]
+    fn the_exact_transfer_is_accepted_in_both_forms() {
+        let (from, to, auth) = (key(6), key(7), key(8));
+        assert!(assert_token_transfer(&transfer_ix(SPL_TRANSFER, 500, from, to, auth, true), 500, &from, &to, &auth).is_ok());
+        assert!(assert_token_transfer(&transfer_ix(SPL_TRANSFER_CHECKED, 500, from, to, auth, true), 500, &from, &to, &auth).is_ok());
+    }
+
+    #[test]
+    fn anything_but_the_exact_transfer_is_refused() {
+        let (from, to, auth) = (key(6), key(7), key(8));
+        let ok = |ix: &Instruction| assert_token_transfer(ix, 500, &from, &to, &auth).is_ok();
+        assert!(!ok(&transfer_ix(SPL_TRANSFER, 499, from, to, auth, true)), "less than credited");
+        assert!(!ok(&transfer_ix(SPL_TRANSFER, 501, from, to, auth, true)), "more than credited");
+        assert!(!ok(&transfer_ix(SPL_TRANSFER, 500, from, key(9), auth, true)), "to elsewhere");
+        assert!(!ok(&transfer_ix(SPL_TRANSFER, 500, key(9), to, auth, true)), "from elsewhere");
+        assert!(!ok(&transfer_ix(SPL_TRANSFER, 500, from, to, key(9), true)), "someone else's authority");
+        assert!(!ok(&transfer_ix(SPL_TRANSFER, 500, from, to, auth, false)), "authority not signing");
+        let mut other_program = transfer_ix(SPL_TRANSFER, 500, from, to, auth, true);
+        other_program.program_id = key(10);
+        assert!(!ok(&other_program), "not SPL Token");
+        let mut approve = transfer_ix(SPL_TRANSFER, 500, from, to, auth, true);
+        approve.data[0] = 4;
+        assert!(!ok(&approve), "an approve, not a transfer");
+    }
+
+    // ---------------------------------------------- the signature rotate_session reads
+
+    /// The Ed25519 precompile's layout, with every offset in this instruction.
+    fn ed25519_ix(signer: &Pubkey, message: &[u8], index_override: Option<u16>) -> Instruction {
+        let header = 2 + 14;
+        let pk_off = header;
+        let sig_off = pk_off + 32;
+        let msg_off = sig_off + 64;
+        let ix = index_override.unwrap_or(0xFFFF);
+        let mut d = vec![1u8, 0];
+        for v in [sig_off as u16, ix, pk_off as u16, ix, msg_off as u16, message.len() as u16, ix] {
+            d.extend_from_slice(&v.to_le_bytes());
+        }
+        d.extend_from_slice(&signer.to_bytes());
+        d.extend_from_slice(&[0u8; 64]);
+        d.extend_from_slice(message);
+        Instruction { program_id: ED25519_PROGRAM_ID, accounts: vec![], data: d }
+    }
+
+    #[test]
+    fn the_owner_over_the_exact_message_is_accepted() {
+        let m = session_message(&key(4), &key(5), 1_800_000_000);
+        assert!(assert_ed25519(&ed25519_ix(&key(1), m.as_bytes(), None), &key(1), m.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn another_signer_message_or_layout_is_refused() {
+        let m = session_message(&key(4), &key(5), 1_800_000_000);
+        let other = session_message(&key(4), &key(6), 1_800_000_000);
+        assert!(assert_ed25519(&ed25519_ix(&key(2), m.as_bytes(), None), &key(1), m.as_bytes()).is_err(), "other signer");
+        assert!(assert_ed25519(&ed25519_ix(&key(1), other.as_bytes(), None), &key(1), m.as_bytes()).is_err(), "other key");
+        assert!(
+            assert_ed25519(&ed25519_ix(&key(1), m.as_bytes(), Some(0)), &key(1), m.as_bytes()).is_err(),
+            "data read from another instruction"
+        );
+        let mut not_precompile = ed25519_ix(&key(1), m.as_bytes(), None);
+        not_precompile.program_id = key(10);
+        assert!(assert_ed25519(&not_precompile, &key(1), m.as_bytes()).is_err(), "not the precompile");
+    }
+
+    #[test]
+    fn the_message_names_key_position_and_expiry() {
+        let m = session_message(&key(4), &key(5), 42);
+        assert!(m.starts_with("Agama on MagicBlock\nAuthorize session key "));
+        assert!(m.contains(&key(5).to_string()) && m.contains(&key(4).to_string()) && m.ends_with(" until 42"));
+    }
+}
