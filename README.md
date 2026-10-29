@@ -274,7 +274,7 @@ contract on an EVM chain is a PDA of a single program here. Everything below is 
 |---|---|---|
 | Program | `GVHsSaFUkVAZJdRKWtK1SxYUhW2P7a7z1xBL5SaFj5vC` | 20 instructions, upgradeable |
 | Vault | `RzouyB4AkAiBP1JvYUmNoEPpK8x77p2hMRAh27NJj6M` | PDA `[agama-vault]`. Mint authority and share accounting |
-| Pool book | `y7QJuSwhnEvA6JLs5uiHWmpbYi2GHtJ6QmMENnv6b6x` | PDA `[lending-book, vault]`. The four pools. Delegated |
+| Pool book | `G164MeGadQebj5zMipbEAm5ssCqoRfjUdiwjpexTCqaU` | PDA `[lending-book-v2, vault]`. The four pools. Delegated. The legacy `[lending-book, vault]` at `y7QJ…XRUTY`… is orphaned, see #9 |
 | agYLD mint | `5v2dRhbcEBWH5YUapkeQV9d3C84Ek4P8hH7tfWPxWCPA` | PDA `[agyld-mint]`, 6 decimals |
 | Test USDC mint | `DuiuxGrD1iQJnuZKw1muqDgYRaV2QGvcqymM8ay4gy4Q` | PDA `[usdc-mint]`, 6 decimals |
 | USDC custody | `ehxmrwjm5WoCMoh3KEe8WwXY35mj5oFbGRcJYF1qiyN` | The vault's ATA, where the collateral sits |
@@ -329,7 +329,7 @@ Its last step is the claim, stated as a measurement rather than an adjective:
        anonymous (no login)      nothing
 ```
 
-## Eight things that cost an afternoon each
+## Nine things that cost an afternoon each
 
 Every one of these is a MagicBlock-specific failure with an error message that
 points somewhere other than the cause. Together they are the real integration
@@ -452,6 +452,20 @@ program can be allowlisted on an eATA's permission.
 loaded as a plain `Account` dies with `Access violation in stack frame 5`. `Box`
 it, or take it as `UncheckedAccount` where only its address matters.
 
+**9. A rollup can lose a delegation the delegation program still records.** On 29
+October the EU rollup started answering every tick, commit and undelegate on the
+book with `ScheduleCommit ERR: account ... is required to be delegated to the
+current validator` and `was illegally used as writable`, while the router and the
+delegation record on Solana both said the book was delegated to that very
+validator. No client transaction can undo it: only the validator can undelegate.
+`migrate_book` copies the legacy book's last committed state into a new PDA
+(`lending-book-v2`), which is then delegated afresh; accrual is a function of
+elapsed time, so the first tick catches up the frozen yield exactly. It went
+unnoticed for a while because the keeper's ticks were confirmed over a websocket
+the proxy does not relay (#5), so failures and successes looked alike. Ticks are
+now sent without waiting, the keeper warns when the book stops moving, and a
+recycled delegation is only accepted once a tick lands on it.
+
 **6. Permission rent has no headroom on the grow path.** `EphemeralPermission::size_of(n)`
 is `35 + (1 + n) * 33`, and `rent(bytes)` is `(bytes + 60) * 32` lamports. A
 permission created with one member and later grown to a four-member cap needs
@@ -490,6 +504,7 @@ custodies, the book bound, and the entry-price average.
 | `deploy.sh` | deploy, initialise, fund the accounts the rollup clones, delegate |
 | `setup.ts` | vault, mints, the four pools, delegation |
 | `topup.ts` | fund the keeper's ephemeral escrow |
+| `migrate-book.ts` | move the book to its current PDA when a rollup has lost track of the old one's delegation (#9) |
 | `keeper.ts` | tick, absorb (both custodies), commit; and the private side via `private-keeper.ts`: batched `commit_shielded`, paying exit tickets |
 | `recycle.ts` | undelegate and re-delegate the book once its 10 sponsored commits are spent; the keeper calls it itself |
 | `state.ts` | read both layers and print the drift |
