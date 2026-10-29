@@ -9,7 +9,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import * as anchor from "@coral-xyz/anchor";
-import { getAuthToken } from "@magicblock-labs/ephemeral-rollups-sdk";
+import { getAuthToken, verifyTeeRpcIntegrity } from "@magicblock-labs/ephemeral-rollups-sdk";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import nacl from "tweetnacl";
 
@@ -83,6 +83,23 @@ export function loadCustodyKeypair(): Keypair {
 }
 /// The private rollup. Positions, the private aggregate and the custody live here.
 export const TEE_RPC = process.env.TEE_ENDPOINT ?? "https://devnet-tee.magicblock.app";
+
+/// Refuse to trust a TEE endpoint until it proves it is one.
+///
+/// Sends a fresh 64-byte challenge, gets back an Intel TDX quote, verifies the
+/// quote's certificate chain against Intel's collateral (through Phala's PCCS)
+/// and checks the challenge is in its report data, so the answer is genuine and
+/// not replayed. What it does not check is *which* code the enclave runs: the
+/// SDK compares no measurement, so this proves "a real TDX enclave answered",
+/// not "MagicBlock's validator build answered". Without it, the only thing
+/// standing between a client and an impostor is DNS.
+const attested = new Set<string>();
+export async function assertTeeAttested(url: string = TEE_RPC): Promise<void> {
+  const u = url.replace(/\/$/, "").split("?")[0];
+  if (attested.has(u) || IS_LOCAL) return;
+  await verifyTeeRpcIntegrity(u);
+  attested.add(u);
+}
 
 export function positionPda(owner: PublicKey): PublicKey {
   return PublicKey.findProgramAddressSync([POSITION_SEED, owner.toBuffer()], PROGRAM_ID)[0];

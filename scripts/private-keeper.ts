@@ -19,6 +19,7 @@ import {
   PROGRAM_ID,
   TEE_RPC,
   TEE_VALIDATOR,
+  assertTeeAttested,
   authedConnectionTo,
   exitsPda,
   loadCustodyKeypair,
@@ -54,6 +55,9 @@ export class PrivateKeeper {
   private er: any;
 
   async connect() {
+    // Custody payouts and the aggregate both go through this endpoint.
+    await assertTeeAttested(TEE_RPC);
+    console.log("TEE      attestation verified (Intel TDX quote, fresh challenge)");
     this.tee = await authedConnectionTo(TEE_RPC, this.wallet);
     this.teeCustody = await authedConnectionTo(TEE_RPC, this.custody);
     this.er = programFor(this.tee, this.wallet);

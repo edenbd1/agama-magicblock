@@ -34,6 +34,7 @@ import {
   TEE_RPC,
   TEE_VALIDATOR,
   agyldMint,
+  assertTeeAttested,
   authedConnectionTo,
   erEndpointFor,
   exitsPda,
@@ -143,6 +144,11 @@ async function main() {
   console.log("wallet    ", wallet.publicKey.toBase58(), "(brand new)");
   console.log("session   ", session.publicKey.toBase58(), "(browser-held)");
   console.log("shield key", shieldKey.publicKey.toBase58(), "(browser-held, one deposit)");
+
+  step("[0]", "verify the TEE is a TDX enclave before trusting it with anything");
+  const t0 = Date.now();
+  await assertTeeAttested(TEE_RPC);
+  console.log(`       quote verified against Intel's collateral, challenge matched (${Date.now() - t0} ms)`);
 
   step("[1]", "fund the wallet and get test USDC");
   await sendAndPoll(base, new Transaction().add(SystemProgram.transfer({ fromPubkey: funder.publicKey, toPubkey: wallet.publicKey, lamports: 200_000_000 })), [funder]);
