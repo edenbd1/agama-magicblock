@@ -956,58 +956,33 @@ pub mod agama_magicblock {
         max_delay_ms: u64,
         split: u32,
     ) -> Result<()> {
-        require!(shares > 0, AgamaError::ZeroAmount);
-        require!(group_id > 0 && group_id <= 0x00FF_FFFF, AgamaError::BadExitParams);
-        require!(
-            split > 0 && min_delay_ms <= max_delay_ms && max_delay_ms <= MAX_EXIT_DELAY_MS,
-            AgamaError::BadExitParams
-        );
         let now = Clock::get()?.unix_timestamp;
         assert_may_act(&ctx.accounts.position, ctx.accounts.signer.key, now)?;
-        require!(
-            ctx.accounts.position.private_shares >= shares,
-            AgamaError::InsufficientShares
-        );
+        let owner = ctx.accounts.position.owner;
+        open_exit(ctx.accounts, shares, group_id, min_delay_ms, max_delay_ms, split, owner, now)
+    }
 
-        let book = read_book(&ctx.accounts.book)?;
-        let (nav, supply) = nav_for_pricing(&ctx.accounts.vault, &book, &ctx.accounts.shielded)?;
-        let assets = u64::try_from(shares as u128 * nav as u128 / supply as u128)
-            .map_err(|_| AgamaError::MathOverflow)?;
-        require!(assets > 0, AgamaError::DustDeposit);
-        // What the private custody holds, by its own books. Tickets already
-        // opened count as paid here, so two redemptions cannot both claim the
-        // same dollars.
-        let held = ctx.accounts.shielded.total_in.saturating_sub(ctx.accounts.shielded.total_out);
-        require!(assets <= held, AgamaError::InsufficientLiquidity);
-        let price = share_price(nav, supply)?;
-
-        let exits = &mut ctx.accounts.exits;
-        require!(
-            !exits.slots.iter().any(|e| e.group_id == group_id),
-            AgamaError::BadExitParams
-        );
-        let slot = exits
-            .slots
-            .iter_mut()
-            .find(|e| e.group_id == 0)
-            .ok_or(AgamaError::ExitBookFull)?;
-        *slot = Exit {
-            owner: ctx.accounts.position.owner,
-            assets,
-            min_delay_ms,
-            max_delay_ms,
-            group_id,
-            split,
-        };
-
-        let position = &mut ctx.accounts.position;
-        position.private_shares -= shares;
-        mark(position, price, now)?;
-
-        let shielded = &mut ctx.accounts.shielded;
-        shielded.shares = shielded.shares.saturating_sub(shares);
-        shielded.total_out = shielded.total_out.saturating_add(assets);
-        Ok(())
+    /// The same, paid to any wallet, for a position whose owner is a stealth key.
+    ///
+    /// A private position can be owned by a key derived from a wallet signature
+    /// instead of by the wallet, so that opening it on Solana never names the
+    /// wallet. That key then has to be able to send the money home, to a wallet
+    /// Solana has never seen next to it, so it chooses the destination. Only the
+    /// owner may, never a session key: a stolen session key still cannot redirect
+    /// anything.
+    pub fn redeem_private_to(
+        ctx: Context<RedeemPrivate>,
+        shares: u64,
+        group_id: u32,
+        min_delay_ms: u64,
+        max_delay_ms: u64,
+        split: u32,
+        payout: Pubkey,
+    ) -> Result<()> {
+        require_keys_eq!(ctx.accounts.signer.key(), ctx.accounts.position.owner, AgamaError::Unauthorized);
+        require!(payout != Pubkey::default(), AgamaError::BadExitParams);
+        let now = Clock::get()?.unix_timestamp;
+        open_exit(ctx.accounts, shares, group_id, min_delay_ms, max_delay_ms, split, payout, now)
     }
 
     /// Close an exit ticket, once the custody has paid it in this same
@@ -1155,6 +1130,58 @@ fn mark(position: &mut Position, price: u64, now: i64) -> Result<()> {
     position.yield_usdc = position.value_usdc.saturating_sub(position.cost_basis);
     position.synced_ts = now;
     position.syncs = position.syncs.saturating_add(1);
+    Ok(())
+}
+
+/// Burn `shares` of a private position and open an exit ticket paying
+/// `destination` at the current share price. The shared body of `redeem_private`
+/// and `redeem_private_to`; the caller has already decided who may do this.
+#[allow(clippy::too_many_arguments)]
+fn open_exit(
+    a: &mut RedeemPrivate,
+    shares: u64,
+    group_id: u32,
+    min_delay_ms: u64,
+    max_delay_ms: u64,
+    split: u32,
+    destination: Pubkey,
+    now: i64,
+) -> Result<()> {
+    require!(shares > 0, AgamaError::ZeroAmount);
+    require!(group_id > 0 && group_id <= 0x00FF_FFFF, AgamaError::BadExitParams);
+    require!(
+        split > 0 && min_delay_ms <= max_delay_ms && max_delay_ms <= MAX_EXIT_DELAY_MS,
+        AgamaError::BadExitParams
+    );
+    require!(a.position.private_shares >= shares, AgamaError::InsufficientShares);
+
+    let book = read_book(&a.book)?;
+    let (nav, supply) = nav_for_pricing(&a.vault, &book, &a.shielded)?;
+    let assets = u64::try_from(shares as u128 * nav as u128 / supply as u128)
+        .map_err(|_| AgamaError::MathOverflow)?;
+    require!(assets > 0, AgamaError::DustDeposit);
+    // What the private custody holds, by its own books. Tickets already opened
+    // count as paid here, so two redemptions cannot both claim the same dollars.
+    let held = a.shielded.total_in.saturating_sub(a.shielded.total_out);
+    require!(assets <= held, AgamaError::InsufficientLiquidity);
+    let price = share_price(nav, supply)?;
+
+    require!(
+        !a.exits.slots.iter().any(|e| e.group_id == group_id),
+        AgamaError::BadExitParams
+    );
+    let slot = a
+        .exits
+        .slots
+        .iter_mut()
+        .find(|e| e.group_id == 0)
+        .ok_or(AgamaError::ExitBookFull)?;
+    *slot = Exit { owner: destination, assets, min_delay_ms, max_delay_ms, group_id, split };
+
+    a.position.private_shares -= shares;
+    mark(&mut a.position, price, now)?;
+    a.shielded.shares = a.shielded.shares.saturating_sub(shares);
+    a.shielded.total_out = a.shielded.total_out.saturating_add(assets);
     Ok(())
 }
 

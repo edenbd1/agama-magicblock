@@ -17,7 +17,8 @@
 // movement is its own top-level instruction and the Agama program only reads it.
 import * as anchor from "@coral-xyz/anchor";
 import { BN } from "@coral-xyz/anchor";
-import { Ed25519Program, Keypair, PublicKey, SYSVAR_INSTRUCTIONS_PUBKEY, TransactionInstruction } from "@solana/web3.js";
+import { createHash } from "crypto";
+import { Ed25519Program, Keypair, PublicKey, SYSVAR_INSTRUCTIONS_PUBKEY, SystemProgram, TransactionInstruction } from "@solana/web3.js";
 import {
   TOKEN_PROGRAM_ID,
   createAssociatedTokenAccountIdempotentInstruction,
@@ -41,7 +42,7 @@ import {
   transferSpl,
   transferToVaultIx,
 } from "@magicblock-labs/ephemeral-rollups-sdk";
-import { TEE_VALIDATOR, bookPda, exitsPda, shieldedPda, usdcMint, vaultPda } from "./common";
+import { TEE_VALIDATOR, agyldMint, bookPda, exitsPda, shieldedPda, usdcMint, vaultPda } from "./common";
 
 export const ata = (owner: PublicKey) => getAssociatedTokenAddressSync(usdcMint, owner, true);
 
@@ -255,4 +256,67 @@ export function sponsoredShieldIxs(shieldKey: PublicKey, sponsor: PublicKey, amo
     createEataPermissionIx(eata, sponsor),
     delegateEphemeralAtaIx(sponsor, eata, TEE_VALIDATOR),
   ];
+}
+
+// ----------------------------------------------------------- stealth owners
+//
+// A position owned by the wallet has to be opened by the wallet, on Solana:
+// "this wallet has a private Agama position", in public. A stealth position is
+// owned by a key derived from the wallet's signature over a fixed message, so
+// the same wallet gets the same key on any device and nothing has to be stored.
+// That key opens the position (the sponsor pays), acts on it inside the enclave
+// directly (it is the owner, no session key needed), and redeems to the wallet
+// with `redeem_private_to`. The wallet's only public transactions are the
+// private send into MagicBlock and the payout it receives from MagicBlock.
+
+export const POSITION_KEY_MESSAGE =
+  "Agama private position key\n\n" +
+  "Signing this derives the key that owns your private Agama position on MagicBlock. " +
+  "Anyone holding this signature can redeem that position, so only sign it on app.agama.finance.";
+
+/// Ed25519 signatures are deterministic, so this is the same key every time.
+export function positionKeyFromSignature(signature: Uint8Array): Keypair {
+  const seed = createHash("sha256").update(Buffer.from("agama-position-key-v1")).update(signature).digest();
+  return Keypair.fromSeed(seed);
+}
+
+/// What the sponsor sends the stealth key so it can open its position: rent for
+/// the Position, the permission prefund, the rollup clone floor and the
+/// delegation accounts. Measured on devnet; the key keeps only dust.
+export const OPEN_LAMPORTS = 35_000_000;
+
+/// Base layer, fee payer the sponsor, signers the sponsor and the stealth key.
+export async function sponsoredOpenIxs(program: anchor.Program, key: PublicKey, sponsor: PublicKey): Promise<TransactionInstruction[]> {
+  const position = PublicKey.findProgramAddressSync([Buffer.from("position-v3"), key.toBuffer()], program.programId)[0];
+  const DLP = new PublicKey("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
+  const pda = (tag: string, owner: PublicKey) => PublicKey.findProgramAddressSync([Buffer.from(tag), position.toBuffer()], owner)[0];
+  return [
+    SystemProgram.transfer({ fromPubkey: sponsor, toPubkey: key, lamports: OPEN_LAMPORTS }),
+    await program.methods.initPosition().accounts({ owner: key, vault: vaultPda, position, systemProgram: SystemProgram.programId }).instruction(),
+    await program.methods.prepareForRollup().accounts({ owner: key, position, ownerAgyld: null, agyldMint, vault: vaultPda, systemProgram: SystemProgram.programId }).instruction(),
+    // The key is its own session key, so clients that look for one find it.
+    await program.methods.authorizeSession(key).accounts({ owner: key, position }).instruction(),
+    await program.methods.delegatePosition().accounts({
+      owner: key,
+      bufferPosition: pda("buffer", program.programId),
+      delegationRecordPosition: pda("delegation", DLP),
+      delegationMetadataPosition: pda("delegation-metadata", DLP),
+      position,
+      validator: TEE_VALIDATOR,
+      ownerProgram: program.programId,
+      delegationProgram: DLP,
+      systemProgram: SystemProgram.programId,
+    }).instruction(),
+  ];
+}
+
+/// TEE, signed by the stealth key: burn shares, pay `payout` through the queue.
+export async function redeemPrivateToIx(
+  program: anchor.Program,
+  args: { owner: PublicKey; position: PublicKey; shares: BN; groupId: number; payout: PublicKey; minDelayMs?: number; maxDelayMs?: number },
+): Promise<TransactionInstruction> {
+  return program.methods
+    .redeemPrivateTo(args.shares, args.groupId, new BN(args.minDelayMs ?? 0), new BN(args.maxDelayMs ?? 0), 1, args.payout)
+    .accounts({ signer: args.owner, position: args.position, vault: vaultPda, book: bookPda, shielded: shieldedPda, exits: exitsPda })
+    .instruction();
 }
