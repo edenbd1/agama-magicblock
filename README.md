@@ -164,7 +164,7 @@ all three.
 | Shares, entry price, value, yield | derivable | inside the TEE, owner (and admitted viewers) only |
 | The redemption payout | from Agama's vault | from MagicBlock's queue, after the keeper's 20 s grace and a random delay |
 | Agama's private side | n/a | one aggregate (`shares`, `total_in`, `total_out`) per batched commit |
-| That the wallet has a private position | n/a | **yes**: `init_position` / `delegate_position` are Agama instructions |
+| That the wallet has a private position | n/a | **no**, with a stealth owner (the default for new depositors): the position belongs to a key derived from the wallet's signature and the sponsor opens it. Positions the wallet opened itself before that still show it |
 | How much the wallet sent, and when | n/a | **yes**: a private send into MagicBlock, visible as such. The delivery to the key happens later (random 5 to 45 s by default) and in two parts |
 
 So the gain is unlinkability, not invisibility. Anyone can see a wallet move N
@@ -175,9 +175,27 @@ shield and the next aggregate, which is why the aggregate only moves in batches,
 why the position setup and the shield are separate transactions, and why it is
 worth stating.
 
-**One wallet approval per deposit** (two the first time: opening the ledger, then
-the private send, kept apart so "this wallet opened an Agama position" and "this
-amount" are never in the same transaction). MagicBlock charges 0.1% on the
+**One wallet transaction per deposit**, the private send into MagicBlock, plus
+one signed message the first time on each device (the position key).
+
+**Stealth owners.** A position the wallet owns has to be opened by the wallet,
+in public. So new private positions are owned by a key derived from the wallet's
+Ed25519 signature over a fixed message (`sha256("agama-position-key-v1" ||
+signature)`; Ed25519 signatures are deterministic, so it is the same key on every
+device and nothing needs backing up). The sponsor opens the position for that
+key, the key acts on it in the enclave as its own owner and session key, and
+`redeem_private_to`, which only the owner may call, pays redemptions to the
+wallet. `scripts/e2e-stealth.ts` checks the result from a wallet funded
+directly: none of the wallet's public transactions invokes the Agama program.
+The cost is that anyone holding that signature can redeem the position, which
+the message says, so it is only to be signed on app.agama.finance.
+
+**Recoverable shield keys.** A shield key holds the USDC between the wallet's
+send and the credit. For a stealth position they are derived from the position
+key, index by index, so a deposit cut off anywhere on the way (a closed tab, a
+slow confirmation, another device) is found on chain and finished with one
+click: the app scans the derived keys for money that was delivered but not
+shielded, or shielded but not credited. MagicBlock charges 0.1% on the
 private send, on top of the amount.
 
 **The sponsor.** The throwaway key receives USDC from MagicBlock's queue and has
@@ -512,6 +530,7 @@ custodies, the book bound, and the entry-price average.
 | `privacy.ts` | the position ledger walk, with the three-reader check |
 | `e2e.ts` | the same from a brand-new keypair |
 | `setup-private.ts` | the private side: `Shielded`, `ExitBook`, their gates, the custody eATA, the exit queue |
+| `e2e-stealth.ts` | a stealth position from a wallet funded directly; checks no public transaction of the wallet invokes Agama |
 | `e2e-private.ts` | a fully private deposit and redemption from a brand-new wallet, with the refusals |
 | `private.ts` | instruction builders for the private path, shared by the scripts |
 | `probe-qfs.ts` | which methods a private endpoint gates, and what it says |
@@ -526,10 +545,14 @@ exercised identically; what it cannot give you is the hardware attestation.
 - **Cranks.** `tick` is written to be a crank target and the keeper is a stand-in
   for one. Moving it to `MagicBlockInstruction::ScheduleTask` removes the last
   piece of infrastructure Agama operates itself.
-- **What the private path still leaks.** Participation (the ledger is opened by an
-  Agama instruction) and the amount and time of the wallet's private send into
-  MagicBlock. Opening ledgers through a relayer would hide participation; varying
-  the split and splitting one deposit across several sends would blur amounts.
+- **What the private path still leaks.** The amount and time of the wallet's
+  private send into MagicBlock, and that the wallet uses MagicBlock at all.
+  Splitting one deposit across several sends, at different times, would blur
+  amounts; the anonymity set is everyone using MagicBlock's private payments.
+- **The sponsor.** It pays to open stealth positions (0.035 SOL each, once per
+  key, for a key with no SOL and no position) and to shield (0.008 SOL). Nothing
+  rate-limits who asks on devnet. In production it wants a per-IP or proof-of-work
+  limit, or a small fee taken from the deposit.
 - **Custody key.** The private custody is an operator key (see #7). MPC or multisig
   on mainnet, or a program-owned custody if MagicBlock lets a program onto an
   eATA's permission.
