@@ -16,7 +16,7 @@
 // Keeping the cross-layer read off-chain means a deposit never stalls the tick.
 import { Connection } from "@solana/web3.js";
 import { BN } from "@coral-xyz/anchor";
-import { BASE_RPC, authedConnectionTo, bookPda, erEndpointFor, loadKeypair, programFor, sendAndPoll, vaultPda, sleep } from "./common";
+import { BASE_RPC, authedConnectionTo, bookPda, delegationStatus, erEndpointFor, loadKeypair, programFor, sendAndPoll, vaultPda, sleep } from "./common";
 import { COMMIT_LIMIT, recycleBook } from "./recycle";
 import { PrivateKeeper, committedShielded } from "./private-keeper";
 
@@ -33,6 +33,12 @@ const usdc = (v: any) => (Number(v.toString()) / 1e6).toFixed(6);
 
 async function main() {
   const wallet = loadKeypair();
+  // A recycle cut off halfway leaves the book on Solana; finish it first, or
+  // there is no rollup to tick on.
+  if (!(await delegationStatus(bookPda))?.isDelegated) {
+    console.log("book is not delegated, finishing the recycle");
+    await recycleBook((...a: any[]) => console.log("recycle ", ...a));
+  }
   const erUrl = await erEndpointFor(bookPda);
   console.log("book     ", bookPda.toBase58());
   console.log("ER       ", erUrl);
@@ -56,6 +62,7 @@ async function main() {
   // Its failures are logged and retried without stopping the book.
   const priv = new PrivateKeeper();
   await priv.connect();
+  await priv.heal();
 
   let n = 0;
   let privAt = 0;
@@ -131,7 +138,16 @@ async function main() {
         }
       }
     } catch (e: any) {
-      console.error("tick failed:", (e?.message ?? String(e)).split("\n")[0]);
+      const msg = (e?.message ?? String(e)).split("\n")[0];
+      console.error("tick failed:", msg);
+      if (msg.includes("is not delegated")) {
+        // A recycle that did not finish. Finish it rather than failing forever.
+        try {
+          await recycle();
+        } catch (r: any) {
+          console.error("recycle failed:", String(r?.message ?? r).split("\n")[0]);
+        }
+      }
       await sleep(2000);
     }
     // On its own clock, so a run of failed ticks never holds up paying an exit.

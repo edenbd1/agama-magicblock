@@ -36,12 +36,21 @@ export async function recycleBook(log = console.log): Promise<void> {
   const baseConn = new Connection(BASE_RPC, "confirmed");
   const base = programFor(baseConn, wallet);
 
-  // 1. Commit and undelegate, from the rollup.
-  const erUrl = await erEndpointFor(bookPda);
-  const erConn = await authedConnectionTo(erUrl, wallet);
-  const er = programFor(erConn, wallet);
-  const tx = await er.methods.undelegateBook().accounts({ payer: wallet.publicKey, book: bookPda }).transaction();
-  log("undelegate", await sendAndPoll(erConn, tx, [wallet]));
+  // Every step checks where the book actually is before acting, so a recycle
+  // cut off halfway (on 30 Oct a network drop stopped one between undelegate
+  // and delegate) finishes on the next call instead of failing at step 1
+  // forever on a book that is no longer delegated.
+
+  // 1. Commit and undelegate, from the rollup, if it is still delegated.
+  if ((await delegationStatus(bookPda))?.isDelegated) {
+    const erUrl = await erEndpointFor(bookPda);
+    const erConn = await authedConnectionTo(erUrl, wallet);
+    const er = programFor(erConn, wallet);
+    const tx = await er.methods.undelegateBook().accounts({ payer: wallet.publicKey, book: bookPda }).transaction();
+    log("undelegate", await sendAndPoll(erConn, tx, [wallet]));
+  } else {
+    log("already undelegated, resuming");
+  }
 
   // 2. Wait for the book to land back on Solana, owned by the program again.
   for (let i = 0; ; i++) {
@@ -62,11 +71,13 @@ export async function recycleBook(log = console.log): Promise<void> {
     );
     log("top up", account.toBase58(), await sendAndPoll(baseConn, fund, [wallet]));
   }
+  if (!(await delegationStatus(bookPda))?.isDelegated) {
   const del = await base.methods
     .delegateBook()
     .accounts({ payer: wallet.publicKey, vault: vaultPda, book: bookPda, validator: ER_VALIDATOR })
     .transaction();
   log("delegate", await sendAndPoll(baseConn, del, [wallet]));
+  }
 
   for (let i = 0; i < 30; i++) {
     const st = await delegationStatus(bookPda);

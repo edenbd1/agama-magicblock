@@ -21,6 +21,7 @@ import {
   TEE_VALIDATOR,
   assertTeeAttested,
   authedConnectionTo,
+  delegationStatus,
   exitsPda,
   loadCustodyKeypair,
   loadKeypair,
@@ -53,6 +54,11 @@ export class PrivateKeeper {
   private tee!: Connection;
   private teeCustody!: Connection;
   private er: any;
+
+  /// Re-delegate the aggregate if a recycle was cut off before it got there.
+  async heal() {
+    if (!(await delegationStatus(shieldedPda))?.isDelegated) await this.recycle();
+  }
 
   async connect() {
     // Custody payouts and the aggregate both go through this endpoint.
@@ -113,18 +119,25 @@ export class PrivateKeeper {
   }
 
   /// Undelegate (which commits), wait for Solana, delegate again, re-gate.
+  /// Resumable, like `recycleBook`: each step checks the real state first.
   async recycle() {
     const log = (...a: any[]) => console.log("recycle shielded", ...a);
-    const tx = await this.er.methods.undelegateShielded().accounts({ payer: this.wallet.publicKey, vault: vaultPda, shielded: shieldedPda }).transaction();
-    log("undelegate", await sendAndPoll(this.tee, tx, [this.wallet]));
+    if ((await delegationStatus(shieldedPda))?.isDelegated) {
+      const tx = await this.er.methods.undelegateShielded().accounts({ payer: this.wallet.publicKey, vault: vaultPda, shielded: shieldedPda }).transaction();
+      log("undelegate", await sendAndPoll(this.tee, tx, [this.wallet]));
+    } else {
+      log("already undelegated, resuming");
+    }
     const baseConn = new Connection(BASE_RPC, "confirmed");
     for (let i = 0; !(await baseConn.getAccountInfo(shieldedPda))?.owner.equals(PROGRAM_ID); i++) {
       if (i >= 60) throw new Error("shielded did not return to Solana within 120s");
       await sleep(2000);
     }
     const base = programFor(baseConn, this.wallet);
-    const del = await base.methods.delegateShielded().accounts({ payer: this.wallet.publicKey, vault: vaultPda, shielded: shieldedPda, validator: TEE_VALIDATOR }).transaction();
-    log("delegate", await sendAndPoll(baseConn, del, [this.wallet]));
+    if (!(await delegationStatus(shieldedPda))?.isDelegated) {
+      const del = await base.methods.delegateShielded().accounts({ payer: this.wallet.publicKey, vault: vaultPda, shielded: shieldedPda, validator: TEE_VALIDATOR }).transaction();
+      log("delegate", await sendAndPoll(baseConn, del, [this.wallet]));
+    }
     for (let i = 0; !(await this.tee.getAccountInfo(shieldedPda)); i++) {
       if (i >= 30) throw new Error("the enclave did not take shielded back within 60s");
       await sleep(2000);

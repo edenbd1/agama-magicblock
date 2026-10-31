@@ -1,3 +1,8 @@
+// A funded devnet wallet for browser tests: 0.25 SOL from the authority and
+// the faucet's 1000 test USDC. Writes the secret key to the path given.
+//
+//   npx tsx scripts/test-wallet.ts /tmp/wallet.json
+
 import fs from "fs";
 import { Connection, Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import { ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from "@solana/spl-token";
