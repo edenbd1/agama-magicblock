@@ -320,3 +320,11 @@ export async function redeemPrivateToIx(
     .accounts({ signer: args.owner, position: args.position, vault: vaultPda, book: bookPda, shielded: shieldedPda, exits: exitsPda })
     .instruction();
 }
+
+/// The n-th shield key of a stealth position, as the app derives it, so a
+/// deposit cut off halfway can be found and finished from any device.
+export function shieldKeyAt(positionKey: Keypair, index: number): Keypair {
+  const idx = Buffer.alloc(4);
+  idx.writeUInt32LE(index, 0);
+  return Keypair.fromSeed(createHash("sha256").update(Buffer.from("agama-shield-key-v1")).update(positionKey.secretKey.subarray(0, 32)).update(idx).digest());
+}
